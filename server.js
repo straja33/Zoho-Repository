@@ -6,7 +6,6 @@ const PORT = Number(process.env.PORT || 2525);
 const ZEPTO_API_URL = process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
 const ZEPTOMAIL_TOKEN = process.env.ZEPTOMAIL_TOKEN;
 const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
-const BOUNCE_ADDRESS = process.env.BOUNCE_ADDRESS;
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
@@ -17,7 +16,6 @@ const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
 
 if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
 if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
-if (!BOUNCE_ADDRESS) throw new Error("Missing env var: BOUNCE_ADDRESS");
 
 const zepto = new SendMailClient({
   url: ZEPTO_API_URL,
@@ -133,8 +131,7 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody }) {
     textbody: textBody && textBody.trim() ? textBody : " ",
     htmlbody: htmlBody && htmlBody.trim()
       ? htmlBody
-      : `<pre>${escapeHtml(textBody || " ")}</pre>`,
-    bounce_address: BOUNCE_ADDRESS
+      : `<pre>${escapeHtml(textBody || " ")}</pre>`
   };
 
   console.log("[ZEPTO] URL:", ZEPTO_API_URL);
@@ -145,7 +142,7 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody }) {
     console.log("[ZEPTO] Success:", JSON.stringify(resp, null, 2));
     return resp;
   } catch (error) {
-    console.error("[ZEPTO] Error object:", error?.message || error);
+    console.error("[ZEPTO] Error object:", error);
     if (error?.response) {
       console.error("[ZEPTO] Error response:", JSON.stringify(error.response, null, 2));
     }
@@ -199,8 +196,7 @@ const server = new SMTPServer({
         subject,
         fromDomain: getDomain(from),
         cleanedTextLength: cleanedText.length,
-        cleanedHtmlLength: cleanedHtml.length,
-        bounceAddress: BOUNCE_ADDRESS
+        cleanedHtmlLength: cleanedHtml.length
       });
 
       await sendToZeptoMail({
@@ -214,7 +210,7 @@ const server = new SMTPServer({
       console.log("[MAIL] Sent successfully");
       callback();
     } catch (err) {
-      console.error("[MAIL] SMTP relay error:", err?.message || err);
+      console.error("[MAIL] SMTP relay error:", err);
       callback(err);
     }
   }
