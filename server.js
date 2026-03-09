@@ -84,7 +84,7 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, replyTo 
     payload.reply_to = [{ address: replyTo }];
   }
 
-  const res = await fetch("https://api.zeptomail.com/v1.1/email", {
+  const res = await fetch("https://api.zeptomail.eu/v1.1/email", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
