@@ -7,12 +7,17 @@ const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
-if (!ZEPTOMAIL_TOKEN) {
-  throw new Error("Missing required environment variable: ZEPTOMAIL_TOKEN");
-}
+const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
+  .split(",")
+  .map(d => d.trim().toLowerCase())
+  .filter(Boolean);
 
-if (!SMTP_USER || !SMTP_PASS) {
-  throw new Error("Missing required environment variables: SMTP_USER and/or SMTP_PASS");
+if (!ZEPTOMAIL_TOKEN) throw new Error("Missing ZEPTOMAIL_TOKEN");
+if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing SMTP_USER or SMTP_PASS");
+
+function domainAllowed(email) {
+  const domain = email.split("@").pop().toLowerCase();
+  return ALLOWED_DOMAINS.includes(domain);
 }
 
 function cleanText(text = "") {
@@ -31,8 +36,6 @@ function cleanText(text = "") {
   const hardContentMarkers = [
     /ctrk\.klclick\.com/i,
     /unsubscribe/i,
-    /rabatt/i,
-    /discount/i,
     /newsletter/i,
     /view in browser/i,
     /manage preferences/i
@@ -44,12 +47,12 @@ function cleanText(text = "") {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
 
-    if (cutMarkers.some((rx) => rx.test(line))) {
+    if (cutMarkers.some(rx => rx.test(line))) {
       cutIndex = i;
       break;
     }
 
-    if (hardContentMarkers.some((rx) => rx.test(line))) {
+    if (hardContentMarkers.some(rx => rx.test(line))) {
       hardMarkerCount++;
       if (hardMarkerCount >= 2) {
         cutIndex = i;
@@ -89,17 +92,10 @@ function escapeHtml(str = "") {
 }
 
 async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, replyTo }) {
+
   const payload = {
-    from: {
-      address: from
-    },
-    to: [
-      {
-        email_address: {
-          address: to
-        }
-      }
-    ],
+    from: { address: from },
+    to: [{ email_address: { address: to } }],
     subject,
     textbody: textBody,
     htmlbody: htmlBody || `<pre>${escapeHtml(textBody)}</pre>`
@@ -113,7 +109,7 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, replyTo 
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Zoho-enczapikey ${ZEPTOMAIL_TOKEN}`
+      Authorization: `Zoho-enczapikey ${ZEPTOMAIL_TOKEN}`
     },
     body: JSON.stringify(payload)
   });
@@ -121,48 +117,54 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, replyTo 
   const body = await res.text();
 
   if (!res.ok) {
-    throw new Error(`ZeptoMail API error ${res.status}: ${body}`);
+    throw new Error(`ZeptoMail error ${res.status}: ${body}`);
   }
 
   return body;
 }
 
 const server = new SMTPServer({
+
   secure: false,
   authOptional: false,
   disabledCommands: ["STARTTLS"],
 
   onAuth(auth, session, callback) {
+
     if (auth.username === SMTP_USER && auth.password === SMTP_PASS) {
       return callback(null, { user: auth.username });
     }
 
-    return callback(new Error("Invalid username or password"));
+    return callback(new Error("Invalid SMTP login"));
   },
 
   async onData(stream, session, callback) {
+
     try {
+
       const parsed = await simpleParser(stream);
 
       const from =
-        parsed.from?.value?.[0]?.address ||
-        FROM_FALLBACK;
+        parsed.from?.value?.[0]?.address || FROM_FALLBACK;
 
       const to =
         parsed.to?.value?.[0]?.address;
 
       const subject = parsed.subject || "Support Reply";
-      const replyTo = parsed.replyTo?.value?.[0]?.address || from;
+
+      const replyTo =
+        parsed.replyTo?.value?.[0]?.address || from;
 
       if (!from || !to) {
         throw new Error("Missing from or to address");
       }
 
-      const textBodyRaw = parsed.text || "";
-      const htmlBodyRaw = parsed.html || "";
+      if (!domainAllowed(from)) {
+        throw new Error(`Blocked sender domain: ${from}`);
+      }
 
-      const cleanedText = cleanText(textBodyRaw);
-      const cleanedHtml = typeof htmlBodyRaw === "string" ? cleanHtml(htmlBodyRaw) : "";
+      const cleanedText = cleanText(parsed.text || "");
+      const cleanedHtml = cleanHtml(parsed.html || "");
 
       await sendToZeptoMail({
         from,
@@ -173,10 +175,14 @@ const server = new SMTPServer({
         replyTo
       });
 
-      console.log(`Sent cleaned email: ${from} -> ${to} | ${subject}`);
+      console.log(`Email sent: ${from} -> ${to}`);
+
       callback();
+
     } catch (err) {
+
       console.error("SMTP relay error:", err);
+
       callback(err);
     }
   }
