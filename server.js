@@ -93,13 +93,21 @@ function escapeHtml(str = "") {
 
 async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, replyTo }) {
 
-  const payload = {
-    from: { address: from },
-    to: [{ email_address: { address: to } }],
-    subject,
-    textbody: textBody,
-    htmlbody: htmlBody || `<pre>${escapeHtml(textBody)}</pre>`
-  };
+const payload = {
+  from: {
+    address: from
+  },
+  to: [
+    {
+      email_address: {
+        address: to
+      }
+    }
+  ],
+  subject: subject,
+  textbody: textBody,
+  htmlbody: htmlBody || `<pre>${escapeHtml(textBody)}</pre>`
+};
 
   if (replyTo) {
     payload.reply_to = [{ address: replyTo }];
