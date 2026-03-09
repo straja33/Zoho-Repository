@@ -4,14 +4,28 @@ import { simpleParser } from "mailparser";
 const PORT = process.env.PORT || 2525;
 const ZEPTOMAIL_TOKEN = process.env.ZEPTOMAIL_TOKEN;
 const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+
+if (!ZEPTOMAIL_TOKEN) {
+  throw new Error("Missing required environment variable: ZEPTOMAIL_TOKEN");
+}
+
+if (!SMTP_USER || !SMTP_PASS) {
+  throw new Error("Missing required environment variables: SMTP_USER and/or SMTP_PASS");
+}
 
 function cleanText(text = "") {
   const lines = text.split(/\r?\n/);
+
   const cutMarkers = [
     /^Am .+ schrieb .+:?$/i,
     /^On .+ wrote:?$/i,
     /^[- ]*Original Message[- ]*$/i,
-    /^From:.+$/i
+    /^From:.+$/i,
+    /^Sent:.+$/i,
+    /^To:.+$/i,
+    /^Subject:.+$/i
   ];
 
   const hardContentMarkers = [
@@ -19,7 +33,9 @@ function cleanText(text = "") {
     /unsubscribe/i,
     /rabatt/i,
     /discount/i,
-    /newsletter/i
+    /newsletter/i,
+    /view in browser/i,
+    /manage preferences/i
   ];
 
   let hardMarkerCount = 0;
@@ -53,7 +69,9 @@ function cleanHtml(html = "") {
     /<div[^>]*>\s*Am .*?schrieb.*$/is,
     /-----Original Message-----.*$/is,
     /ctrk\.klclick\.com.*$/is,
-    /unsubscribe.*$/is
+    /unsubscribe.*$/is,
+    /view in browser.*$/is,
+    /manage preferences.*$/is
   ];
 
   for (const pattern of patterns) {
@@ -61,6 +79,13 @@ function cleanHtml(html = "") {
   }
 
   return cleaned.trim();
+}
+
+function escapeHtml(str = "") {
+  return str
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }
 
 async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, replyTo }) {
@@ -102,20 +127,19 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, replyTo 
   return body;
 }
 
-function escapeHtml(str = "") {
-  return str
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
-}
-
 const server = new SMTPServer({
   secure: false,
-  authOptional: true,
+  authOptional: false,
   disabledCommands: ["STARTTLS"],
+
   onAuth(auth, session, callback) {
-    return callback(null, { user: auth.username || "reamaze" });
+    if (auth.username === SMTP_USER && auth.password === SMTP_PASS) {
+      return callback(null, { user: auth.username });
+    }
+
+    return callback(new Error("Invalid username or password"));
   },
+
   async onData(stream, session, callback) {
     try {
       const parsed = await simpleParser(stream);
