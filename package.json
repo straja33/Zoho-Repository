@@ -1,7 +1,7 @@
 {
   "name": "zoho-smtp-relay",
   "version": "1.0.0",
-  "description": "SMTP relay that cleans Reamaze replies and forwards them to ZeptoMail",
+  "description": "SMTP relay that cleans Re:amaze replies and forwards them to ZeptoMail",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -9,6 +9,10 @@
   },
   "dependencies": {
     "mailparser": "^3.7.2",
-    "smtp-server": "^3.13.6"
+    "smtp-server": "^3.13.6",
+    "zeptomail": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
