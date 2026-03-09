@@ -1,39 +1,26 @@
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
+import { SendMailClient } from "zeptomail";
 
 const PORT = Number(process.env.PORT || 2525);
+const ZEPTO_API_URL = process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
 const ZEPTOMAIL_TOKEN = process.env.ZEPTOMAIL_TOKEN;
 const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
-const ZEPTO_API_URL = process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
 
 const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
   .split(",")
   .map((d) => d.trim().toLowerCase())
   .filter(Boolean);
 
-if (!ZEPTOMAIL_TOKEN) {
-  throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
-}
+if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
+if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
 
-if (!SMTP_USER || !SMTP_PASS) {
-  throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
-}
-
-if (!FROM_FALLBACK) {
-  console.warn("[BOOT] FROM_FALLBACK is empty. This is allowed, but not recommended.");
-}
-
-if (ALLOWED_DOMAINS.length === 0) {
-  console.warn("[BOOT] ALLOWED_DOMAINS is empty. Domain protection is disabled.");
-}
-
-function maskToken(token = "") {
-  if (!token) return "";
-  if (token.length <= 10) return "***";
-  return `${token.slice(0, 6)}***${token.slice(-4)}`;
-}
+const zepto = new SendMailClient({
+  url: ZEPTO_API_URL,
+  token: ZEPTOMAIL_TOKEN
+});
 
 function getDomain(email = "") {
   const parts = String(email).toLowerCase().trim().split("@");
@@ -42,8 +29,7 @@ function getDomain(email = "") {
 
 function isAllowedDomain(email = "") {
   if (ALLOWED_DOMAINS.length === 0) return true;
-  const domain = getDomain(email);
-  return ALLOWED_DOMAINS.includes(domain);
+  return ALLOWED_DOMAINS.includes(getDomain(email));
 }
 
 function escapeHtml(str = "") {
@@ -54,9 +40,7 @@ function escapeHtml(str = "") {
 }
 
 function cleanText(text = "") {
-  if (!text) return "";
-
-  const lines = String(text).split(/\r?\n/);
+  const lines = String(text || "").split(/\r?\n/);
 
   const quoteMarkers = [
     /^On .+ wrote:$/i,
@@ -88,7 +72,7 @@ function cleanText(text = "") {
     }
 
     if (marketingMarkers.some((rx) => rx.test(line))) {
-      marketingHits += 1;
+      marketingHits++;
       if (marketingHits >= 2) {
         cutIndex = i;
         break;
@@ -100,9 +84,7 @@ function cleanText(text = "") {
 }
 
 function cleanHtml(html = "") {
-  if (!html) return "";
-
-  let out = String(html);
+  let out = String(html || "");
 
   const patterns = [
     /<div[^>]*>\s*On .*?wrote:.*$/is,
@@ -121,73 +103,50 @@ function cleanHtml(html = "") {
   return out.trim();
 }
 
-function summarizeMail(parsed) {
+function summarize(parsed) {
   return {
     subject: parsed.subject || "",
     from: parsed.from?.value?.map((x) => x.address) || [],
     to: parsed.to?.value?.map((x) => x.address) || [],
-    cc: parsed.cc?.value?.map((x) => x.address) || [],
-    replyTo: parsed.replyTo?.value?.map((x) => x.address) || [],
     hasText: !!parsed.text,
     hasHtml: !!parsed.html,
-    textLength: parsed.text ? parsed.text.length : 0,
+    textLength: parsed.text?.length || 0,
     htmlLength: typeof parsed.html === "string" ? parsed.html.length : 0,
-    attachments: parsed.attachments?.map((a) => ({
-      filename: a.filename,
-      contentType: a.contentType,
-      size: a.size,
-    })) || [],
   };
 }
 
 async function sendToZeptoMail({ from, to, subject, textBody, htmlBody }) {
   const payload = {
     from: {
-      address: from,
+      address: from
     },
     to: [
       {
         email_address: {
-          address: to,
-        },
-      },
+          address: to
+        }
+      }
     ],
     subject: subject || "Support Reply",
     textbody: textBody && textBody.trim() ? textBody : " ",
     htmlbody: htmlBody && htmlBody.trim()
       ? htmlBody
-      : `<pre>${escapeHtml(textBody && textBody.trim() ? textBody : " ")}</pre>`,
+      : `<pre>${escapeHtml(textBody || " ")}</pre>`
   };
 
   console.log("[ZEPTO] URL:", ZEPTO_API_URL);
   console.log("[ZEPTO] Payload:", JSON.stringify(payload, null, 2));
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
-
   try {
-    const res = await fetch(ZEPTO_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Zoho-enczapikey ${ZEPTOMAIL_TOKEN}`,
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-
-    const body = await res.text();
-
-    console.log("[ZEPTO] Status:", res.status);
-    console.log("[ZEPTO] Response:", body);
-
-    if (!res.ok) {
-      throw new Error(`ZeptoMail error ${res.status}: ${body}`);
+    const resp = await zepto.sendMail(payload);
+    console.log("[ZEPTO] Success:", JSON.stringify(resp, null, 2));
+    return resp;
+  } catch (error) {
+    console.error("[ZEPTO] Error object:", error);
+    if (error?.response) {
+      console.error("[ZEPTO] Error response:", JSON.stringify(error.response, null, 2));
     }
-
-    return body;
-  } finally {
-    clearTimeout(timeout);
+    throw error;
   }
 }
 
@@ -196,31 +155,15 @@ const server = new SMTPServer({
   authOptional: false,
   disabledCommands: ["STARTTLS"],
 
-  onConnect(session, callback) {
-    console.log("[SMTP] Connect:", {
-      remoteAddress: session.remoteAddress,
-      clientHostname: session.clientHostname,
-      hostNameAppearsAs: session.hostNameAppearsAs,
-    });
-    callback();
-  },
-
   onAuth(auth, session, callback) {
-    console.log("[SMTP] Auth attempt:", {
-      username: auth.username,
-      remoteAddress: session.remoteAddress,
-    });
+    console.log("[SMTP] Auth attempt:", auth.username, session.remoteAddress);
 
     if (auth.username === SMTP_USER && auth.password === SMTP_PASS) {
-      console.log("[SMTP] Auth success:", auth.username);
+      console.log("[SMTP] Auth success");
       return callback(null, { user: auth.username });
     }
 
-    console.error("[SMTP] Auth failed:", {
-      username: auth.username,
-      remoteAddress: session.remoteAddress,
-    });
-
+    console.error("[SMTP] Auth failed");
     return callback(new Error("Invalid SMTP login"));
   },
 
@@ -228,7 +171,7 @@ const server = new SMTPServer({
     try {
       const parsed = await simpleParser(stream);
 
-      console.log("[MAIL] Parsed summary:", JSON.stringify(summarizeMail(parsed), null, 2));
+      console.log("[MAIL] Parsed:", JSON.stringify(summarize(parsed), null, 2));
 
       const parsedFrom = parsed.from?.value?.[0]?.address || "";
       const parsedTo = parsed.to?.value?.[0]?.address || "";
@@ -237,74 +180,42 @@ const server = new SMTPServer({
       const to = parsedTo;
       const subject = parsed.subject || "Support Reply";
 
-      if (!from) {
-        throw new Error("Missing FROM address and FROM_FALLBACK is empty");
-      }
-
-      if (!to) {
-        throw new Error("Missing TO address");
-      }
+      if (!from) throw new Error("Missing FROM address");
+      if (!to) throw new Error("Missing TO address");
 
       if (!isAllowedDomain(from)) {
         throw new Error(`Blocked sender domain: ${from}`);
       }
 
-      const rawText = parsed.text || "";
-      const rawHtml = typeof parsed.html === "string" ? parsed.html : "";
+      const cleanedText = cleanText(parsed.text || "");
+      const cleanedHtml = cleanHtml(typeof parsed.html === "string" ? parsed.html : "");
 
-      const cleanedText = cleanText(rawText);
-      const cleanedHtml = cleanHtml(rawHtml);
-
-      console.log("[MAIL] Delivery info:", {
+      console.log("[MAIL] Sending:", {
         from,
         to,
         subject,
         fromDomain: getDomain(from),
-        toDomain: getDomain(to),
         cleanedTextLength: cleanedText.length,
-        cleanedHtmlLength: cleanedHtml.length,
+        cleanedHtmlLength: cleanedHtml.length
       });
 
-      const zeptoResponse = await sendToZeptoMail({
+      await sendToZeptoMail({
         from,
         to,
         subject,
         textBody: cleanedText,
-        htmlBody: cleanedHtml,
+        htmlBody: cleanedHtml
       });
 
-      console.log("[MAIL] Sent successfully:", {
-        from,
-        to,
-        subject,
-        zeptoResponse,
-      });
-
+      console.log("[MAIL] Sent successfully");
       callback();
     } catch (err) {
       console.error("[MAIL] SMTP relay error:", err);
       callback(err);
     }
-  },
-
-  onClose(session) {
-    console.log("[SMTP] Connection closed:", {
-      remoteAddress: session?.remoteAddress,
-    });
-  },
-
-  logger: false,
-});
-
-server.on("error", (err) => {
-  console.error("[SERVER] Fatal server error:", err);
+  }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("[BOOT] SMTP relay listening");
-  console.log("[BOOT] Port:", PORT);
-  console.log("[BOOT] From fallback:", FROM_FALLBACK || "(empty)");
-  console.log("[BOOT] Allowed domains:", ALLOWED_DOMAINS);
-  console.log("[BOOT] Zepto URL:", ZEPTO_API_URL);
-  console.log("[BOOT] Zepto token:", maskToken(ZEPTOMAIL_TOKEN));
+  console.log("[BOOT] SMTP relay listening on port", PORT);
 });
