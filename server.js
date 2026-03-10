@@ -8,6 +8,11 @@ const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
+const MAX_CONCURRENT_SENDS = Number(process.env.MAX_CONCURRENT_SENDS || 10);
+const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
+const RETRY_COUNT = Number(process.env.RETRY_COUNT || 3);
+const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 1500);
+
 const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
   .split(",")
   .map((d) => d.trim().toLowerCase())
@@ -15,6 +20,10 @@ const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
 
 if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
 if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
+
+const queue = [];
+let activeSends = 0;
+let jobIdCounter = 0;
 
 function getDomain(email = "") {
   const parts = String(email).toLowerCase().trim().split("@");
@@ -33,10 +42,20 @@ function escapeHtml(str = "") {
     .replaceAll(">", "&gt;");
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetry(status, message = "") {
+  if ([429, 500, 502, 503, 504].includes(status)) return true;
+  return /timeout|network|fetch failed|socket hang up|temporar/i.test(String(message).toLowerCase());
+}
+
 function cleanText(text = "") {
   const lines = String(text || "").split(/\r?\n/);
 
   const quoteMarkers = [
+    /^--$/,
     /^On .+ wrote:$/i,
     /^Am .+ schrieb .+:?$/i,
     /^[- ]*Original Message[- ]*$/i,
@@ -97,19 +116,7 @@ function cleanHtml(html = "") {
   return out.trim();
 }
 
-function summarize(parsed) {
-  return {
-    subject: parsed.subject || "",
-    from: parsed.from?.value?.map((x) => x.address) || [],
-    to: parsed.to?.value?.map((x) => x.address) || [],
-    hasText: !!parsed.text,
-    hasHtml: !!parsed.html,
-    textLength: parsed.text?.length || 0,
-    htmlLength: typeof parsed.html === "string" ? parsed.html.length : 0,
-  };
-}
-
-async function sendToZeptoMail({ from, to, subject, textBody, htmlBody }) {
+async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, jobId }) {
   const payload = {
     from: {
       address: from
@@ -128,28 +135,97 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody }) {
       : `<pre>${escapeHtml(textBody || " ")}</pre>`
   };
 
-  console.log("[ZEPTO] URL:", ZEPTO_API_URL);
-  console.log("[ZEPTO] Payload:", JSON.stringify(payload, null, 2));
+  for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
 
-  const res = await fetch(ZEPTO_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": ZEPTOMAIL_TOKEN
-    },
-    body: JSON.stringify(payload)
-  });
+    try {
+      const res = await fetch(ZEPTO_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": ZEPTOMAIL_TOKEN
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
 
-  const raw = await res.text();
+      const raw = await res.text();
 
-  console.log("[ZEPTO] Status:", res.status);
-  console.log("[ZEPTO] Raw response:", raw);
+      console.log(`[ZEPTO][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`);
 
-  if (!res.ok) {
-    throw new Error(`ZeptoMail error ${res.status}: ${raw}`);
+      if (!res.ok) {
+        const err = new Error(`ZeptoMail error ${res.status}: ${raw}`);
+        err.status = res.status;
+        err.raw = raw;
+
+        if (attempt < RETRY_COUNT && shouldRetry(res.status, raw)) {
+          console.warn(`[ZEPTO][${jobId}] Retrying after status ${res.status}`);
+          await sleep(RETRY_DELAY_MS * attempt);
+          continue;
+        }
+
+        throw err;
+      }
+
+      return raw;
+    } catch (err) {
+      const msg = err?.message || String(err);
+      const status = err?.status || 0;
+
+      if (attempt < RETRY_COUNT && shouldRetry(status, msg)) {
+        console.warn(`[ZEPTO][${jobId}] Retry ${attempt}/${RETRY_COUNT} after error: ${msg}`);
+        await sleep(RETRY_DELAY_MS * attempt);
+        continue;
+      }
+
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+}
 
-  return raw;
+function processQueue() {
+  while (activeSends < MAX_CONCURRENT_SENDS && queue.length > 0) {
+    const job = queue.shift();
+    activeSends++;
+
+    (async () => {
+      try {
+        await sendToZeptoMail(job.data);
+        console.log(`[QUEUE][${job.id}] Sent | active=${activeSends - 1} queued=${queue.length}`);
+        job.resolve();
+      } catch (err) {
+        console.error(`[QUEUE][${job.id}] Failed:`, err?.message || err);
+        job.reject(err);
+      } finally {
+        activeSends--;
+        processQueue();
+      }
+    })();
+  }
+}
+
+function enqueueSend(data) {
+  return new Promise((resolve, reject) => {
+    const id = ++jobIdCounter;
+    queue.push({ id, data: { ...data, jobId: id }, resolve, reject });
+    console.log(`[QUEUE][${id}] Enqueued | active=${activeSends} queued=${queue.length}`);
+    processQueue();
+  });
+}
+
+function summarize(parsed) {
+  return {
+    subject: parsed.subject || "",
+    from: parsed.from?.value?.map((x) => x.address) || [],
+    to: parsed.to?.value?.map((x) => x.address) || [],
+    hasText: !!parsed.text,
+    hasHtml: !!parsed.html,
+    textLength: parsed.text?.length || 0,
+    htmlLength: typeof parsed.html === "string" ? parsed.html.length : 0,
+  };
 }
 
 const server = new SMTPServer({
@@ -158,14 +234,10 @@ const server = new SMTPServer({
   disabledCommands: ["STARTTLS"],
 
   onAuth(auth, session, callback) {
-    console.log("[SMTP] Auth attempt:", auth.username, session.remoteAddress);
-
     if (auth.username === SMTP_USER && auth.password === SMTP_PASS) {
-      console.log("[SMTP] Auth success");
       return callback(null, { user: auth.username });
     }
 
-    console.error("[SMTP] Auth failed");
     return callback(new Error("Invalid SMTP login"));
   },
 
@@ -173,7 +245,7 @@ const server = new SMTPServer({
     try {
       const parsed = await simpleParser(stream);
 
-      console.log("[MAIL] Parsed:", JSON.stringify(summarize(parsed), null, 2));
+      console.log("[MAIL] Parsed:", JSON.stringify(summarize(parsed)));
 
       const parsedFrom = parsed.from?.value?.[0]?.address || "";
       const parsedTo = parsed.to?.value?.[0]?.address || "";
@@ -192,16 +264,7 @@ const server = new SMTPServer({
       const cleanedText = cleanText(parsed.text || "");
       const cleanedHtml = cleanHtml(typeof parsed.html === "string" ? parsed.html : "");
 
-      console.log("[MAIL] Sending:", {
-        from,
-        to,
-        subject,
-        fromDomain: getDomain(from),
-        cleanedTextLength: cleanedText.length,
-        cleanedHtmlLength: cleanedHtml.length
-      });
-
-      await sendToZeptoMail({
+      await enqueueSend({
         from,
         to,
         subject,
@@ -209,7 +272,6 @@ const server = new SMTPServer({
         htmlBody: cleanedHtml
       });
 
-      console.log("[MAIL] Sent successfully");
       callback();
     } catch (err) {
       console.error("[MAIL] SMTP relay error:", err?.message || err);
@@ -220,4 +282,7 @@ const server = new SMTPServer({
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] SMTP relay listening on port", PORT);
+  console.log("[BOOT] MAX_CONCURRENT_SENDS =", MAX_CONCURRENT_SENDS);
+  console.log("[BOOT] SEND_TIMEOUT_MS =", SEND_TIMEOUT_MS);
+  console.log("[BOOT] RETRY_COUNT =", RETRY_COUNT);
 });
