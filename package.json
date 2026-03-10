@@ -8,13 +8,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "mailparser": "^3.7.2",
-    "smtp-server": "^3.13.6"
-  }
-}
-"dependencies": {
   "bullmq": "^5.7.8",
   "ioredis": "^5.4.1",
   "mailparser": "^3.7.1",
   "smtp-server": "^3.13.3"
+  }
 }
