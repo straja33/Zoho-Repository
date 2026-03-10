@@ -54,12 +54,13 @@ let jobIdCounter = 0;
 
 const zohoTransport = nodemailer.createTransport({
   host: ZOHO_SMTP_HOST,
-  port: ZOHO_SMTP_PORT,
-  secure: true,
+  port: 587,
+  secure: false,
   auth: {
     user: ZOHO_SMTP_USER,
     pass: ZOHO_SMTP_PASS
   },
+  requireTLS: true,
   connectionTimeout: SEND_TIMEOUT_MS,
   greetingTimeout: SEND_TIMEOUT_MS,
   socketTimeout: SEND_TIMEOUT_MS
