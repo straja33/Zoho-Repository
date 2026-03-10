@@ -1,12 +1,9 @@
-// server.js
-
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
 import { Queue, Worker, QueueEvents } from "bullmq";
 import IORedis from "ioredis";
 
 const PORT = Number(process.env.PORT || 2525);
-
 const REDIS_URL = process.env.REDIS_URL;
 const QUEUE_NAME = process.env.QUEUE_NAME || "smtp-relay-jobs";
 
@@ -18,12 +15,13 @@ const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
-const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 10);
-const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
+const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 20);
+const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 10);
+const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 3);
 
+const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
 const JOB_ATTEMPTS = Number(process.env.JOB_ATTEMPTS || 4);
 const JOB_BACKOFF_MS = Number(process.env.JOB_BACKOFF_MS || 3000);
-
 const PROVIDER_RETRY_COUNT = Number(process.env.PROVIDER_RETRY_COUNT || 2);
 const PROVIDER_RETRY_DELAY_MS = Number(
   process.env.PROVIDER_RETRY_DELAY_MS || 1500
@@ -111,6 +109,19 @@ const queueEvents = new QueueEvents(QUEUE_NAME, {
 
 let zohoAccessToken = null;
 let zohoTokenExpiry = 0;
+
+const providerLimiterState = {
+  zepto: {
+    limit: ZEPTO_CONCURRENCY,
+    active: 0,
+    waiters: [],
+  },
+  zoho: {
+    limit: ZOHO_CONCURRENCY,
+    active: 0,
+    waiters: [],
+  },
+};
 
 function getDomain(email = "") {
   const parts = String(email).toLowerCase().trim().split("@");
@@ -214,6 +225,31 @@ async function getZohoAccessToken() {
   console.log("[ZOHO TOKEN] New access token cached");
 
   return zohoAccessToken;
+}
+
+async function acquireProviderSlot(provider) {
+  const key = provider === "zoho" ? "zoho" : "zepto";
+  const state = providerLimiterState[key];
+
+  if (state.active < state.limit) {
+    state.active += 1;
+    return () => releaseProviderSlot(key);
+  }
+
+  await new Promise((resolve) => {
+    state.waiters.push(resolve);
+  });
+
+  state.active += 1;
+  return () => releaseProviderSlot(key);
+}
+
+function releaseProviderSlot(provider) {
+  const state = providerLimiterState[provider];
+  state.active = Math.max(0, state.active - 1);
+
+  const next = state.waiters.shift();
+  if (next) next();
 }
 
 async function sendViaZohoMailApi({
@@ -357,11 +393,18 @@ async function sendViaZeptoMail({ from, to, subject, textBody, jobId }) {
 }
 
 async function sendEmail(job) {
-  if (shouldUseZohoFallback(job.to)) {
-    return sendViaZohoMailApi(job);
-  }
+  const provider = shouldUseZohoFallback(job.to) ? "zoho" : "zepto";
+  const release = await acquireProviderSlot(provider);
 
-  return sendViaZeptoMail(job);
+  try {
+    if (provider === "zoho") {
+      return sendViaZohoMailApi(job);
+    }
+
+    return sendViaZeptoMail(job);
+  } finally {
+    release();
+  }
 }
 
 async function enqueueSend(data) {
@@ -415,8 +458,14 @@ const worker = new Worker(
       jobId: job.id,
     };
 
+    const providerState = providerLimiterState[payload.provider] || {
+      active: 0,
+      limit: 0,
+      waiters: [],
+    };
+
     console.log(
-      `[WORKER][${job.id}] Processing | route=${payload.routeName} | provider=${payload.provider} | attempt=${job.attemptsMade + 1}/${JOB_ATTEMPTS}`
+      `[WORKER][${job.id}] Processing | route=${payload.routeName} | provider=${payload.provider} | attempt=${job.attemptsMade + 1}/${JOB_ATTEMPTS} | providerActive=${providerState.active}/${providerState.limit}`
     );
 
     await sendEmail(payload);
@@ -526,7 +575,7 @@ async function shutdown(signal) {
   console.log(`[SHUTDOWN] ${signal} received`);
 
   try {
-    await server.close();
+    server.close();
   } catch {}
 
   try {
@@ -554,6 +603,9 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] SMTP relay listening on port", PORT);
   console.log("[BOOT] WORKER_CONCURRENCY =", WORKER_CONCURRENCY);
+  console.log("[BOOT] ZEPTO_CONCURRENCY =", ZEPTO_CONCURRENCY);
+  console.log("[BOOT] ZOHO_CONCURRENCY =", ZOHO_CONCURRENCY);
   console.log("[BOOT] QUEUE_NAME =", QUEUE_NAME);
   console.log("[BOOT] ROUTE_RULES =", JSON.stringify(ROUTE_RULES));
 });
+EOF
