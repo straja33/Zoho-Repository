@@ -16,8 +16,8 @@ const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
 const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 20);
-const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 10);
-const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 3);
+const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 15);
+const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 5);
 
 const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
 const JOB_ATTEMPTS = Number(process.env.JOB_ATTEMPTS || 4);
