@@ -1,17 +1,33 @@
+// server.js
+
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
+import { Queue, Worker, QueueEvents } from "bullmq";
+import IORedis from "ioredis";
 
 const PORT = Number(process.env.PORT || 2525);
-const ZEPTO_API_URL = process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
+
+const REDIS_URL = process.env.REDIS_URL;
+const QUEUE_NAME = process.env.QUEUE_NAME || "smtp-relay-jobs";
+
+const ZEPTO_API_URL =
+  process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
 const ZEPTOMAIL_TOKEN = process.env.ZEPTOMAIL_TOKEN;
+
 const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
-const MAX_CONCURRENT_SENDS = Number(process.env.MAX_CONCURRENT_SENDS || 10);
+const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 10);
 const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
-const RETRY_COUNT = Number(process.env.RETRY_COUNT || 3);
-const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 1500);
+
+const JOB_ATTEMPTS = Number(process.env.JOB_ATTEMPTS || 4);
+const JOB_BACKOFF_MS = Number(process.env.JOB_BACKOFF_MS || 3000);
+
+const PROVIDER_RETRY_COUNT = Number(process.env.PROVIDER_RETRY_COUNT || 2);
+const PROVIDER_RETRY_DELAY_MS = Number(
+  process.env.PROVIDER_RETRY_DELAY_MS || 1500
+);
 
 const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
   .split(",")
@@ -26,7 +42,7 @@ const SIGNATURE_DOMAINS = [
   "www.hike-care.com",
   "www.hikecarewinkel.nl",
   "www.gardenhomie.com",
-  "www.hikecare.co.uk"
+  "www.hikecare.co.uk",
 ];
 
 const ROUTE_RULES = (() => {
@@ -42,8 +58,10 @@ const ROUTE_RULES = (() => {
       provider: String(rule.provider || "zepto").trim().toLowerCase(),
       fromAddress: String(rule.fromAddress || "").trim(),
       domains: Array.isArray(rule.domains)
-        ? rule.domains.map((d) => String(d).trim().toLowerCase()).filter(Boolean)
-        : []
+        ? rule.domains
+            .map((d) => String(d).trim().toLowerCase())
+            .filter(Boolean)
+        : [],
     }));
   } catch (err) {
     throw new Error(`Invalid ROUTE_RULES_JSON: ${err.message}`);
@@ -55,15 +73,41 @@ const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
 const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
 const ZOHO_ACCOUNT_ID = process.env.ZOHO_ACCOUNT_ID;
 
+if (!REDIS_URL) throw new Error("Missing env var: REDIS_URL");
 if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
-if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
-if (!ZOHO_CLIENT_ID || !ZOHO_CLIENT_SECRET || !ZOHO_REFRESH_TOKEN || !ZOHO_ACCOUNT_ID) {
+if (!SMTP_USER || !SMTP_PASS) {
+  throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
+}
+if (
+  !ZOHO_CLIENT_ID ||
+  !ZOHO_CLIENT_SECRET ||
+  !ZOHO_REFRESH_TOKEN ||
+  !ZOHO_ACCOUNT_ID
+) {
   throw new Error("Missing Zoho Mail API env vars");
 }
 
-const queue = [];
-let activeSends = 0;
-let jobIdCounter = 0;
+const redisConnection = new IORedis(REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
+
+const queue = new Queue(QUEUE_NAME, {
+  connection: redisConnection,
+  defaultJobOptions: {
+    attempts: JOB_ATTEMPTS,
+    backoff: {
+      type: "exponential",
+      delay: JOB_BACKOFF_MS,
+    },
+    removeOnComplete: 500,
+    removeOnFail: 1000,
+  },
+});
+
+const queueEvents = new QueueEvents(QUEUE_NAME, {
+  connection: redisConnection.duplicate(),
+});
 
 let zohoAccessToken = null;
 let zohoTokenExpiry = 0;
@@ -90,7 +134,7 @@ function getRoute(recipientEmail = "") {
   return {
     name: "zepto-default",
     provider: "zepto",
-    fromAddress: ""
+    fromAddress: "",
   };
 }
 
@@ -111,7 +155,9 @@ function sleep(ms) {
 
 function shouldRetry(status, message = "") {
   if ([429, 500, 502, 503, 504].includes(status)) return true;
-  return /timeout|network|fetch failed|socket hang up|temporar/i.test(String(message).toLowerCase());
+  return /timeout|network|fetch failed|socket hang up|temporar/i.test(
+    String(message).toLowerCase()
+  );
 }
 
 function cleanText(text = "") {
@@ -139,15 +185,15 @@ async function getZohoAccessToken() {
     refresh_token: ZOHO_REFRESH_TOKEN,
     client_id: ZOHO_CLIENT_ID,
     client_secret: ZOHO_CLIENT_SECRET,
-    grant_type: "refresh_token"
+    grant_type: "refresh_token",
   });
 
   const res = await fetch("https://accounts.zoho.eu/oauth/v2/token", {
     method: "POST",
     headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
+      "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: params.toString()
+    body: params.toString(),
   });
 
   const raw = await res.text();
@@ -177,13 +223,13 @@ async function sendViaZohoMailApi({
   textBody,
   jobId,
   inReplyTo,
-  references
+  references,
 }) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
   const route = getRoute(to);
   const actualFrom = route.fromAddress || from;
 
-  for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
+  for (let attempt = 1; attempt <= PROVIDER_RETRY_COUNT; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
 
@@ -195,27 +241,34 @@ async function sendViaZohoMailApi({
         toAddress: to,
         subject: subject || "Support Reply",
         content: safeText,
-        mailFormat: "plaintext"
+        mailFormat: "plaintext",
       };
 
       if (inReplyTo) payload.inReplyTo = inReplyTo;
-      if (references) payload.references = Array.isArray(references) ? references.join(" ") : references;
+      if (references) {
+        payload.references = Array.isArray(references)
+          ? references.join(" ")
+          : references;
+      }
 
-      const res = await fetch(`https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages`, {
-        method: "POST",
-        headers: {
-          Authorization: `Zoho-oauthtoken ${accessToken}`,
-          "Content-Type": "application/json",
-          Accept: "application/json"
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
+      const res = await fetch(
+        `https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Zoho-oauthtoken ${accessToken}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        }
+      );
 
       const raw = await res.text();
 
       console.log(
-        `[ZOHO-API][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | route=${route.name} | ${actualFrom} -> ${to} | ${subject}`
+        `[ZOHO-API][${jobId}] Attempt ${attempt}/${PROVIDER_RETRY_COUNT} -> ${res.status} | route=${route.name} | ${actualFrom} -> ${to} | ${subject}`
       );
 
       if (!res.ok) {
@@ -228,8 +281,8 @@ async function sendViaZohoMailApi({
         err.status = res.status;
         err.raw = raw;
 
-        if (attempt < RETRY_COUNT && shouldRetry(res.status, raw)) {
-          await sleep(RETRY_DELAY_MS * attempt);
+        if (attempt < PROVIDER_RETRY_COUNT && shouldRetry(res.status, raw)) {
+          await sleep(PROVIDER_RETRY_DELAY_MS * attempt);
           continue;
         }
 
@@ -243,32 +296,26 @@ async function sendViaZohoMailApi({
   }
 }
 
-async function sendViaZeptoMail({
-  from,
-  to,
-  subject,
-  textBody,
-  jobId
-}) {
+async function sendViaZeptoMail({ from, to, subject, textBody, jobId }) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
 
   const payload = {
     from: {
-      address: from
+      address: from,
     },
     to: [
       {
         email_address: {
-          address: to
-        }
-      }
+          address: to,
+        },
+      },
     ],
     subject: subject || "Support Reply",
     textbody: safeText,
-    htmlbody: `<pre>${escapeHtml(safeText)}</pre>`
+    htmlbody: `<pre>${escapeHtml(safeText)}</pre>`,
   };
 
-  for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
+  for (let attempt = 1; attempt <= PROVIDER_RETRY_COUNT; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
 
@@ -277,16 +324,16 @@ async function sendViaZeptoMail({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: ZEPTOMAIL_TOKEN
+          Authorization: ZEPTOMAIL_TOKEN,
         },
         body: JSON.stringify(payload),
-        signal: controller.signal
+        signal: controller.signal,
       });
 
       const raw = await res.text();
 
       console.log(
-        `[ZEPTO][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`
+        `[ZEPTO][${jobId}] Attempt ${attempt}/${PROVIDER_RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`
       );
 
       if (!res.ok) {
@@ -294,8 +341,8 @@ async function sendViaZeptoMail({
         err.status = res.status;
         err.raw = raw;
 
-        if (attempt < RETRY_COUNT && shouldRetry(res.status, raw)) {
-          await sleep(RETRY_DELAY_MS * attempt);
+        if (attempt < PROVIDER_RETRY_COUNT && shouldRetry(res.status, raw)) {
+          await sleep(PROVIDER_RETRY_DELAY_MS * attempt);
           continue;
         }
 
@@ -317,45 +364,32 @@ async function sendEmail(job) {
   return sendViaZeptoMail(job);
 }
 
-function processQueue() {
-  while (activeSends < MAX_CONCURRENT_SENDS && queue.length > 0) {
-    const job = queue.shift();
-    activeSends++;
+async function enqueueSend(data) {
+  const route = getRoute(data.to);
 
-    (async () => {
-      try {
-        await sendEmail(job.data);
-        console.log(`[QUEUE][${job.id}] Sent | active=${activeSends - 1} queued=${queue.length}`);
-        job.resolve();
-      } catch (err) {
-        console.error(`[QUEUE][${job.id}] Failed:`, err?.message || err);
-        job.reject(err);
-      } finally {
-        activeSends--;
-        processQueue();
-      }
-    })();
-  }
-}
+  const job = await queue.add(
+    "send-email",
+    {
+      ...data,
+      routeName: route.name,
+      provider: route.provider,
+    },
+    {
+      attempts: JOB_ATTEMPTS,
+      backoff: {
+        type: "exponential",
+        delay: JOB_BACKOFF_MS,
+      },
+      removeOnComplete: 500,
+      removeOnFail: 1000,
+    }
+  );
 
-function enqueueSend(data) {
-  return new Promise((resolve, reject) => {
-    const id = ++jobIdCounter;
-    const route = getRoute(data.to);
+  console.log(
+    `[QUEUE][${job.id}] Enqueued | route=${route.name} | provider=${route.provider}`
+  );
 
-    queue.push({
-      id,
-      data: { ...data, jobId: id },
-      resolve,
-      reject
-    });
-
-    console.log(
-      `[QUEUE][${id}] Enqueued | route=${route.name} | provider=${route.provider} | active=${activeSends} queued=${queue.length}`
-    );
-
-    processQueue();
-  });
+  return job;
 }
 
 function summarize(parsed) {
@@ -369,9 +403,49 @@ function summarize(parsed) {
     htmlLength: typeof parsed.html === "string" ? parsed.html.length : 0,
     messageId: parsed.messageId || "",
     inReplyTo: parsed.inReplyTo || "",
-    references: parsed.references || []
+    references: parsed.references || [],
   };
 }
+
+const worker = new Worker(
+  QUEUE_NAME,
+  async (job) => {
+    const payload = {
+      ...job.data,
+      jobId: job.id,
+    };
+
+    console.log(
+      `[WORKER][${job.id}] Processing | route=${payload.routeName} | provider=${payload.provider} | attempt=${job.attemptsMade + 1}/${JOB_ATTEMPTS}`
+    );
+
+    await sendEmail(payload);
+
+    console.log(`[WORKER][${job.id}] Sent`);
+  },
+  {
+    connection: redisConnection.duplicate(),
+    concurrency: WORKER_CONCURRENCY,
+  }
+);
+
+worker.on("failed", (job, err) => {
+  console.error(
+    `[WORKER][${job?.id}] Failed | attemptsMade=${job?.attemptsMade} | ${err?.message || err}`
+  );
+});
+
+worker.on("completed", (job) => {
+  console.log(`[WORKER][${job.id}] Completed`);
+});
+
+queueEvents.on("failed", ({ jobId, failedReason }) => {
+  console.error(`[QUEUE][${jobId}] Final failure | ${failedReason}`);
+});
+
+queueEvents.on("completed", ({ jobId }) => {
+  console.log(`[QUEUE][${jobId}] Completed`);
+});
 
 const server = new SMTPServer({
   secure: false,
@@ -415,33 +489,71 @@ const server = new SMTPServer({
       const route = getRoute(to);
 
       console.log("[CLEAN] text before/after:", rawText.length, "->", cleanedText.length);
-      console.log("[ROUTE]", route.name.toUpperCase(), "| provider =", route.provider, "| recipient =", to);
+      console.log(
+        "[ROUTE]",
+        route.name.toUpperCase(),
+        "| provider =",
+        route.provider,
+        "| recipient =",
+        to
+      );
       console.log("[THREAD]", {
         messageId,
         inReplyTo,
-        references: Array.isArray(references) ? references.join(" ") : references
+        references: Array.isArray(references) ? references.join(" ") : references,
       });
 
-      await enqueueSend({
+      const job = await enqueueSend({
         from,
         to,
         subject,
         textBody: cleanedText,
         inReplyTo,
         references,
-        messageId
+        messageId,
       });
 
+      console.log(`[MAIL] Accepted and queued as job ${job.id}`);
       callback();
     } catch (err) {
       console.error("[MAIL] SMTP relay error:", err?.message || err);
       callback(err);
     }
-  }
+  },
 });
+
+async function shutdown(signal) {
+  console.log(`[SHUTDOWN] ${signal} received`);
+
+  try {
+    await server.close();
+  } catch {}
+
+  try {
+    await worker.close();
+  } catch {}
+
+  try {
+    await queueEvents.close();
+  } catch {}
+
+  try {
+    await queue.close();
+  } catch {}
+
+  try {
+    await redisConnection.quit();
+  } catch {}
+
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] SMTP relay listening on port", PORT);
-  console.log("[BOOT] MAX_CONCURRENT_SENDS =", MAX_CONCURRENT_SENDS);
+  console.log("[BOOT] WORKER_CONCURRENCY =", WORKER_CONCURRENCY);
+  console.log("[BOOT] QUEUE_NAME =", QUEUE_NAME);
   console.log("[BOOT] ROUTE_RULES =", JSON.stringify(ROUTE_RULES));
 });
