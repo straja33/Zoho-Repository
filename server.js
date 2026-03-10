@@ -7,7 +7,7 @@ import IORedis from "ioredis";
 import http from "http";
 
 const PORT = Number(process.env.PORT || 2525);
-const MONITOR_PORT = Number(process.env.MONITOR_PORT || 8080);
+const MONITOR_PORT = Number(process.env.MONITOR_PORT || process.env.PORT || 8080);
 
 const REDIS_URL = process.env.REDIS_URL;
 
@@ -22,8 +22,8 @@ const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
-const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 15);
-const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 5);
+const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 10);
+const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 3);
 
 const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
 
@@ -40,6 +40,9 @@ const BREAKER_FAILURE_THRESHOLD = Number(
 );
 const BREAKER_WINDOW_MS = Number(process.env.BREAKER_WINDOW_MS || 60000);
 const BREAKER_OPEN_MS = Number(process.env.BREAKER_OPEN_MS || 120000);
+
+const RECENT_EMAILS_KEY = process.env.RECENT_EMAILS_KEY || "smtp-relay:recent";
+const RECENT_EMAILS_LIMIT = Number(process.env.RECENT_EMAILS_LIMIT || 50);
 
 const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
   .split(",")
@@ -350,6 +353,52 @@ function onProviderFailure(provider, status, message = "") {
   }
 }
 
+function maskEmail(email = "") {
+  const [local = "", domain = ""] = String(email).split("@");
+  if (!domain) return email;
+
+  if (local.length <= 2) return `${local[0] || "*"}***@${domain}`;
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+function trimSubject(subject = "", max = 160) {
+  const s = String(subject || "");
+  return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+function safeString(value = "", max = 300) {
+  const s = String(value || "");
+  return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+async function addRecentEvent(event) {
+  const payload = JSON.stringify({
+    ...event,
+    timestamp: event.timestamp || new Date().toISOString(),
+  });
+
+  await redisConnection.multi()
+    .lpush(RECENT_EMAILS_KEY, payload)
+    .ltrim(RECENT_EMAILS_KEY, 0, RECENT_EMAILS_LIMIT - 1)
+    .exec();
+}
+
+async function getRecentEvents(limit = RECENT_EMAILS_LIMIT) {
+  const rows = await redisConnection.lrange(
+    RECENT_EMAILS_KEY,
+    0,
+    Math.max(0, limit - 1)
+  );
+
+  return rows.map((row) => {
+    try {
+      return JSON.parse(row);
+    } catch {
+      return { raw: row };
+    }
+  });
+}
+
 async function getZohoAccessToken() {
   const now = Date.now();
 
@@ -611,11 +660,22 @@ async function enqueueSend(data) {
 
   metrics.enqueued[provider]++;
 
+  await addRecentEvent({
+    stage: "queued",
+    provider,
+    routeName: route.name,
+    jobId: String(job.id),
+    from: maskEmail(data.from),
+    to: maskEmail(data.to),
+    subject: trimSubject(data.subject),
+    status: "queued",
+  });
+
   console.log(
     `[QUEUE][${provider.toUpperCase()}][${job.id}] Enqueued | route=${route.name} | ${data.from} -> ${data.to}`
   );
 
-  return { job, provider };
+  return { job, provider, routeName: route.name };
 }
 
 function summarize(parsed) {
@@ -708,6 +768,17 @@ const zeptoWorker = new Worker(
     metrics.completed.zepto++;
     metrics.lastSentAt.zepto = new Date().toISOString();
 
+    await addRecentEvent({
+      stage: "sent",
+      provider: "zepto",
+      routeName: payload.routeName || "zepto-default",
+      jobId: String(job.id),
+      from: maskEmail(payload.from),
+      to: maskEmail(payload.to),
+      subject: trimSubject(payload.subject),
+      status: "sent",
+    });
+
     console.log(`[WORKER][ZEPTO][${job.id}] Sent`);
   },
   {
@@ -734,6 +805,17 @@ const zohoWorker = new Worker(
     metrics.completed.zoho++;
     metrics.lastSentAt.zoho = new Date().toISOString();
 
+    await addRecentEvent({
+      stage: "sent",
+      provider: "zoho",
+      routeName: payload.routeName || "zoho",
+      jobId: String(job.id),
+      from: maskEmail(payload.from),
+      to: maskEmail(payload.to),
+      subject: trimSubject(payload.subject),
+      status: "sent",
+    });
+
     console.log(`[WORKER][ZOHO][${job.id}] Sent`);
   },
   {
@@ -742,18 +824,44 @@ const zohoWorker = new Worker(
   }
 );
 
-zeptoWorker.on("failed", (job, err) => {
+zeptoWorker.on("failed", async (job, err) => {
   metrics.failed.zepto++;
   metrics.lastFailureAt.zepto = new Date().toISOString();
+
+  await addRecentEvent({
+    stage: "failed",
+    provider: "zepto",
+    routeName: job?.data?.routeName || "zepto-default",
+    jobId: String(job?.id || ""),
+    from: maskEmail(job?.data?.from || ""),
+    to: maskEmail(job?.data?.to || ""),
+    subject: trimSubject(job?.data?.subject || ""),
+    status: "failed",
+    error: safeString(err?.message || String(err)),
+    attemptsMade: job?.attemptsMade ?? null,
+  });
 
   console.error(
     `[WORKER][ZEPTO][${job?.id}] Failed | attemptsMade=${job?.attemptsMade} | ${err?.message || err}`
   );
 });
 
-zohoWorker.on("failed", (job, err) => {
+zohoWorker.on("failed", async (job, err) => {
   metrics.failed.zoho++;
   metrics.lastFailureAt.zoho = new Date().toISOString();
+
+  await addRecentEvent({
+    stage: "failed",
+    provider: "zoho",
+    routeName: job?.data?.routeName || "zoho",
+    jobId: String(job?.id || ""),
+    from: maskEmail(job?.data?.from || ""),
+    to: maskEmail(job?.data?.to || ""),
+    subject: trimSubject(job?.data?.subject || ""),
+    status: "failed",
+    error: safeString(err?.message || String(err)),
+    attemptsMade: job?.attemptsMade ?? null,
+  });
 
   console.error(
     `[WORKER][ZOHO][${job?.id}] Failed | attemptsMade=${job?.attemptsMade} | ${err?.message || err}`
@@ -903,6 +1011,24 @@ const monitorServer = http.createServer(async (req, res) => {
       return;
     }
 
+    if (url === "/recent") {
+      const recent = await getRecentEvents();
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          {
+            count: recent.length,
+            limit: RECENT_EMAILS_LIMIT,
+            items: recent,
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
   } catch (err) {
@@ -970,10 +1096,11 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] BREAKER_FAILURE_THRESHOLD =", BREAKER_FAILURE_THRESHOLD);
   console.log("[BOOT] BREAKER_WINDOW_MS =", BREAKER_WINDOW_MS);
   console.log("[BOOT] BREAKER_OPEN_MS =", BREAKER_OPEN_MS);
+  console.log("[BOOT] RECENT_EMAILS_LIMIT =", RECENT_EMAILS_LIMIT);
   console.log("[BOOT] ROUTE_RULES =", JSON.stringify(ROUTE_RULES));
 });
 
 monitorServer.listen(MONITOR_PORT, "0.0.0.0", () => {
   console.log("[BOOT] Monitor server listening on port", MONITOR_PORT);
-  console.log("[BOOT] Health endpoints: /health /queue /metrics");
+  console.log("[BOOT] Health endpoints: /health /queue /metrics /recent");
 });
