@@ -1,11 +1,18 @@
+// server.js
+
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
 import { Queue, Worker, QueueEvents } from "bullmq";
 import IORedis from "ioredis";
+import http from "http";
 
 const PORT = Number(process.env.PORT || 2525);
+const MONITOR_PORT = Number(process.env.MONITOR_PORT || 8080);
+
 const REDIS_URL = process.env.REDIS_URL;
-const QUEUE_NAME = process.env.QUEUE_NAME || "smtp-relay-jobs";
+
+const ZEPTO_QUEUE_NAME = process.env.ZEPTO_QUEUE_NAME || "smtp-relay-zepto";
+const ZOHO_QUEUE_NAME = process.env.ZOHO_QUEUE_NAME || "smtp-relay-zoho";
 
 const ZEPTO_API_URL =
   process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
@@ -15,17 +22,24 @@ const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
-const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 20);
-const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 15);
-const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 5);
+const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 10);
+const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 3);
 
 const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
-const JOB_ATTEMPTS = Number(process.env.JOB_ATTEMPTS || 4);
-const JOB_BACKOFF_MS = Number(process.env.JOB_BACKOFF_MS || 3000);
+
+const JOB_ATTEMPTS = Number(process.env.JOB_ATTEMPTS || 6);
+const JOB_BACKOFF_MS = Number(process.env.JOB_BACKOFF_MS || 15000);
+
 const PROVIDER_RETRY_COUNT = Number(process.env.PROVIDER_RETRY_COUNT || 2);
 const PROVIDER_RETRY_DELAY_MS = Number(
-  process.env.PROVIDER_RETRY_DELAY_MS || 1500
+  process.env.PROVIDER_RETRY_DELAY_MS || 2000
 );
+
+const BREAKER_FAILURE_THRESHOLD = Number(
+  process.env.BREAKER_FAILURE_THRESHOLD || 5
+);
+const BREAKER_WINDOW_MS = Number(process.env.BREAKER_WINDOW_MS || 60000);
+const BREAKER_OPEN_MS = Number(process.env.BREAKER_OPEN_MS || 120000);
 
 const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
   .split(",")
@@ -90,7 +104,7 @@ const redisConnection = new IORedis(REDIS_URL, {
   enableReadyCheck: false,
 });
 
-const queue = new Queue(QUEUE_NAME, {
+const zeptoQueue = new Queue(ZEPTO_QUEUE_NAME, {
   connection: redisConnection,
   defaultJobOptions: {
     attempts: JOB_ATTEMPTS,
@@ -98,30 +112,80 @@ const queue = new Queue(QUEUE_NAME, {
       type: "exponential",
       delay: JOB_BACKOFF_MS,
     },
-    removeOnComplete: 500,
-    removeOnFail: 1000,
+    removeOnComplete: 1000,
+    removeOnFail: 2000,
   },
 });
 
-const queueEvents = new QueueEvents(QUEUE_NAME, {
+const zohoQueue = new Queue(ZOHO_QUEUE_NAME, {
+  connection: redisConnection,
+  defaultJobOptions: {
+    attempts: JOB_ATTEMPTS,
+    backoff: {
+      type: "exponential",
+      delay: JOB_BACKOFF_MS,
+    },
+    removeOnComplete: 1000,
+    removeOnFail: 2000,
+  },
+});
+
+const zeptoQueueEvents = new QueueEvents(ZEPTO_QUEUE_NAME, {
   connection: redisConnection.duplicate(),
 });
 
-let zohoAccessToken = null;
-let zohoTokenExpiry = 0;
+const zohoQueueEvents = new QueueEvents(ZOHO_QUEUE_NAME, {
+  connection: redisConnection.duplicate(),
+});
 
-const providerLimiterState = {
-  zepto: {
-    limit: ZEPTO_CONCURRENCY,
-    active: 0,
-    waiters: [],
+const metrics = {
+  accepted: 0,
+  rejected: 0,
+  enqueued: {
+    zepto: 0,
+    zoho: 0,
   },
-  zoho: {
-    limit: ZOHO_CONCURRENCY,
-    active: 0,
-    waiters: [],
+  completed: {
+    zepto: 0,
+    zoho: 0,
+  },
+  failed: {
+    zepto: 0,
+    zoho: 0,
+  },
+  providerRetries: {
+    zepto: 0,
+    zoho: 0,
+  },
+  smtpErrors: 0,
+  lastAcceptedAt: null,
+  lastSentAt: {
+    zepto: null,
+    zoho: null,
+  },
+  lastFailureAt: {
+    zepto: null,
+    zoho: null,
   },
 };
+
+const circuitBreakers = {
+  zepto: {
+    state: "CLOSED",
+    openedUntil: 0,
+    halfOpenInFlight: false,
+    failures: [],
+  },
+  zoho: {
+    state: "CLOSED",
+    openedUntil: 0,
+    halfOpenInFlight: false,
+    failures: [],
+  },
+};
+
+let zohoAccessToken = null;
+let zohoTokenExpiry = 0;
 
 function getDomain(email = "") {
   const parts = String(email).toLowerCase().trim().split("@");
@@ -149,10 +213,6 @@ function getRoute(recipientEmail = "") {
   };
 }
 
-function shouldUseZohoFallback(recipientEmail = "") {
-  return getRoute(recipientEmail).provider === "zoho";
-}
-
 function escapeHtml(str = "") {
   return String(str)
     .replaceAll("&", "&amp;")
@@ -162,13 +222,6 @@ function escapeHtml(str = "") {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function shouldRetry(status, message = "") {
-  if ([429, 500, 502, 503, 504].includes(status)) return true;
-  return /timeout|network|fetch failed|socket hang up|temporar/i.test(
-    String(message).toLowerCase()
-  );
 }
 
 function cleanText(text = "") {
@@ -183,6 +236,118 @@ function cleanText(text = "") {
   }
 
   return String(text || "").trim();
+}
+
+function shouldRetry(status, message = "") {
+  if ([429, 500, 502, 503, 504].includes(status)) return true;
+  return /timeout|network|fetch failed|socket hang up|temporar|circuit open/i.test(
+    String(message).toLowerCase()
+  );
+}
+
+function isBreakerFailure(status, message = "") {
+  if ([429, 500, 502, 503, 504].includes(status)) return true;
+  return /timeout|network|fetch failed|socket hang up|temporar/i.test(
+    String(message).toLowerCase()
+  );
+}
+
+function getBreaker(provider) {
+  return circuitBreakers[provider];
+}
+
+function normalizeBreaker(provider) {
+  const breaker = getBreaker(provider);
+  const now = Date.now();
+
+  breaker.failures = breaker.failures.filter(
+    (ts) => now - ts <= BREAKER_WINDOW_MS
+  );
+
+  if (breaker.state === "OPEN" && now >= breaker.openedUntil) {
+    breaker.state = "HALF_OPEN";
+    breaker.halfOpenInFlight = false;
+  }
+
+  return breaker;
+}
+
+function beforeProviderSend(provider) {
+  const breaker = normalizeBreaker(provider);
+
+  if (breaker.state === "OPEN") {
+    const remainingMs = Math.max(0, breaker.openedUntil - Date.now());
+    const err = new Error(
+      `Circuit open for provider=${provider}. Retry after ${remainingMs}ms`
+    );
+    err.status = 503;
+    err.retryable = true;
+    throw err;
+  }
+
+  if (breaker.state === "HALF_OPEN") {
+    if (breaker.halfOpenInFlight) {
+      const err = new Error(
+        `Circuit half-open for provider=${provider}. Test request already in flight`
+      );
+      err.status = 503;
+      err.retryable = true;
+      throw err;
+    }
+
+    breaker.halfOpenInFlight = true;
+  }
+}
+
+function onProviderSuccess(provider) {
+  const breaker = normalizeBreaker(provider);
+
+  if (breaker.state === "HALF_OPEN") {
+    console.log(`[BREAKER][${provider}] HALF_OPEN -> CLOSED`);
+  }
+
+  breaker.state = "CLOSED";
+  breaker.failures = [];
+  breaker.openedUntil = 0;
+  breaker.halfOpenInFlight = false;
+}
+
+function onProviderFailure(provider, status, message = "") {
+  const breaker = normalizeBreaker(provider);
+  const now = Date.now();
+
+  if (breaker.state === "HALF_OPEN") {
+    breaker.state = "OPEN";
+    breaker.openedUntil = now + BREAKER_OPEN_MS;
+    breaker.halfOpenInFlight = false;
+    breaker.failures = [now];
+    console.log(
+      `[BREAKER][${provider}] HALF_OPEN -> OPEN for ${BREAKER_OPEN_MS}ms`
+    );
+    return;
+  }
+
+  if (!isBreakerFailure(status, message)) {
+    return;
+  }
+
+  breaker.failures.push(now);
+  breaker.failures = breaker.failures.filter(
+    (ts) => now - ts <= BREAKER_WINDOW_MS
+  );
+
+  if (
+    breaker.state === "CLOSED" &&
+    breaker.failures.length >= BREAKER_FAILURE_THRESHOLD
+  ) {
+    breaker.state = "OPEN";
+    breaker.openedUntil = now + BREAKER_OPEN_MS;
+    breaker.halfOpenInFlight = false;
+
+    console.log(
+      `[BREAKER][${provider}] CLOSED -> OPEN | failures=${breaker.failures.length} | openMs=${BREAKER_OPEN_MS}`
+    );
+  }
 }
 
 async function getZohoAccessToken() {
@@ -227,29 +392,100 @@ async function getZohoAccessToken() {
   return zohoAccessToken;
 }
 
-async function acquireProviderSlot(provider) {
-  const key = provider === "zoho" ? "zoho" : "zepto";
-  const state = providerLimiterState[key];
+async function sendViaZeptoMail({
+  from,
+  to,
+  subject,
+  textBody,
+  jobId,
+  provider = "zepto",
+}) {
+  const safeText = textBody && textBody.trim() ? textBody : " ";
 
-  if (state.active < state.limit) {
-    state.active += 1;
-    return () => releaseProviderSlot(key);
+  const payload = {
+    from: {
+      address: from,
+    },
+    to: [
+      {
+        email_address: {
+          address: to,
+        },
+      },
+    ],
+    subject: subject || "Support Reply",
+    textbody: safeText,
+    htmlbody: `<pre>${escapeHtml(safeText)}</pre>`,
+  };
+
+  for (let attempt = 1; attempt <= PROVIDER_RETRY_COUNT; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+
+    try {
+      beforeProviderSend(provider);
+
+      const res = await fetch(ZEPTO_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: ZEPTOMAIL_TOKEN,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      const raw = await res.text();
+
+      console.log(
+        `[ZEPTO][${jobId}] Attempt ${attempt}/${PROVIDER_RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`
+      );
+
+      if (!res.ok) {
+        onProviderFailure(provider, res.status, raw);
+
+        const err = new Error(`ZeptoMail error ${res.status}: ${raw}`);
+        err.status = res.status;
+        err.raw = raw;
+        err.retryable = shouldRetry(res.status, raw);
+
+        if (attempt < PROVIDER_RETRY_COUNT && err.retryable) {
+          metrics.providerRetries.zepto++;
+          await sleep(PROVIDER_RETRY_DELAY_MS * attempt);
+          continue;
+        }
+
+        throw err;
+      }
+
+      onProviderSuccess(provider);
+      return raw;
+    } catch (err) {
+      const status = err?.status || 503;
+      const message = err?.message || String(err);
+
+      if (!/ZeptoMail error/.test(message)) {
+        onProviderFailure(provider, status, message);
+      }
+
+      const retryable =
+        err?.retryable === true || shouldRetry(status, message);
+
+      if (attempt < PROVIDER_RETRY_COUNT && retryable) {
+        metrics.providerRetries.zepto++;
+        await sleep(PROVIDER_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+      const breaker = getBreaker(provider);
+      if (breaker.state !== "HALF_OPEN") {
+        breaker.halfOpenInFlight = false;
+      }
+    }
   }
-
-  await new Promise((resolve) => {
-    state.waiters.push(resolve);
-  });
-
-  state.active += 1;
-  return () => releaseProviderSlot(key);
-}
-
-function releaseProviderSlot(provider) {
-  const state = providerLimiterState[provider];
-  state.active = Math.max(0, state.active - 1);
-
-  const next = state.waiters.shift();
-  if (next) next();
 }
 
 async function sendViaZohoMailApi({
@@ -260,6 +496,7 @@ async function sendViaZohoMailApi({
   jobId,
   inReplyTo,
   references,
+  provider = "zoho",
 }) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
   const route = getRoute(to);
@@ -270,6 +507,8 @@ async function sendViaZohoMailApi({
     const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
 
     try {
+      beforeProviderSend(provider);
+
       const accessToken = await getZohoAccessToken();
 
       const payload = {
@@ -313,11 +552,15 @@ async function sendViaZohoMailApi({
           zohoTokenExpiry = 0;
         }
 
+        onProviderFailure(provider, res.status, raw);
+
         const err = new Error(`Zoho Mail API error ${res.status}: ${raw}`);
         err.status = res.status;
         err.raw = raw;
+        err.retryable = shouldRetry(res.status, raw);
 
-        if (attempt < PROVIDER_RETRY_COUNT && shouldRetry(res.status, raw)) {
+        if (attempt < PROVIDER_RETRY_COUNT && err.retryable) {
+          metrics.providerRetries.zoho++;
           await sleep(PROVIDER_RETRY_DELAY_MS * attempt);
           continue;
         }
@@ -325,114 +568,54 @@ async function sendViaZohoMailApi({
         throw err;
       }
 
+      onProviderSuccess(provider);
       return raw;
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-}
+    } catch (err) {
+      const status = err?.status || 503;
+      const message = err?.message || String(err);
 
-async function sendViaZeptoMail({ from, to, subject, textBody, jobId }) {
-  const safeText = textBody && textBody.trim() ? textBody : " ";
-
-  const payload = {
-    from: {
-      address: from,
-    },
-    to: [
-      {
-        email_address: {
-          address: to,
-        },
-      },
-    ],
-    subject: subject || "Support Reply",
-    textbody: safeText,
-    htmlbody: `<pre>${escapeHtml(safeText)}</pre>`,
-  };
-
-  for (let attempt = 1; attempt <= PROVIDER_RETRY_COUNT; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
-
-    try {
-      const res = await fetch(ZEPTO_API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: ZEPTOMAIL_TOKEN,
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-
-      const raw = await res.text();
-
-      console.log(
-        `[ZEPTO][${jobId}] Attempt ${attempt}/${PROVIDER_RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`
-      );
-
-      if (!res.ok) {
-        const err = new Error(`ZeptoMail error ${res.status}: ${raw}`);
-        err.status = res.status;
-        err.raw = raw;
-
-        if (attempt < PROVIDER_RETRY_COUNT && shouldRetry(res.status, raw)) {
-          await sleep(PROVIDER_RETRY_DELAY_MS * attempt);
-          continue;
-        }
-
-        throw err;
+      if (!/Zoho Mail API error/.test(message)) {
+        onProviderFailure(provider, status, message);
       }
 
-      return raw;
+      const retryable =
+        err?.retryable === true || shouldRetry(status, message);
+
+      if (attempt < PROVIDER_RETRY_COUNT && retryable) {
+        metrics.providerRetries.zoho++;
+        await sleep(PROVIDER_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+
+      throw err;
     } finally {
       clearTimeout(timeout);
+      const breaker = getBreaker(provider);
+      if (breaker.state !== "HALF_OPEN") {
+        breaker.halfOpenInFlight = false;
+      }
     }
-  }
-}
-
-async function sendEmail(job) {
-  const provider = shouldUseZohoFallback(job.to) ? "zoho" : "zepto";
-  const release = await acquireProviderSlot(provider);
-
-  try {
-    if (provider === "zoho") {
-      return sendViaZohoMailApi(job);
-    }
-
-    return sendViaZeptoMail(job);
-  } finally {
-    release();
   }
 }
 
 async function enqueueSend(data) {
   const route = getRoute(data.to);
+  const provider = route.provider === "zoho" ? "zoho" : "zepto";
+  const queue = provider === "zoho" ? zohoQueue : zeptoQueue;
 
-  const job = await queue.add(
-    "send-email",
-    {
-      ...data,
-      routeName: route.name,
-      provider: route.provider,
-    },
-    {
-      attempts: JOB_ATTEMPTS,
-      backoff: {
-        type: "exponential",
-        delay: JOB_BACKOFF_MS,
-      },
-      removeOnComplete: 500,
-      removeOnFail: 1000,
-    }
-  );
+  const job = await queue.add("send-email", {
+    ...data,
+    routeName: route.name,
+    provider,
+  });
+
+  metrics.enqueued[provider]++;
 
   console.log(
-    `[QUEUE][${job.id}] Enqueued | route=${route.name} | provider=${route.provider}`
+    `[QUEUE][${provider.toUpperCase()}][${job.id}] Enqueued | route=${route.name} | ${data.from} -> ${data.to}`
   );
 
-  return job;
+  return { job, provider };
 }
 
 function summarize(parsed) {
@@ -450,50 +633,139 @@ function summarize(parsed) {
   };
 }
 
-const worker = new Worker(
-  QUEUE_NAME,
+async function getOldestWaitingAgeMs(queue) {
+  const jobs = await queue.getJobs(["waiting", "delayed"], 0, 0, true);
+
+  if (!jobs || jobs.length === 0) return 0;
+
+  const oldest = jobs[0];
+  const timestamp = oldest?.timestamp || Date.now();
+  return Math.max(0, Date.now() - timestamp);
+}
+
+async function getQueueSnapshot() {
+  const [
+    zeptoCounts,
+    zohoCounts,
+    zeptoOldestAgeMs,
+    zohoOldestAgeMs,
+  ] = await Promise.all([
+    zeptoQueue.getJobCounts(
+      "waiting",
+      "active",
+      "completed",
+      "failed",
+      "delayed",
+      "paused"
+    ),
+    zohoQueue.getJobCounts(
+      "waiting",
+      "active",
+      "completed",
+      "failed",
+      "delayed",
+      "paused"
+    ),
+    getOldestWaitingAgeMs(zeptoQueue),
+    getOldestWaitingAgeMs(zohoQueue),
+  ]);
+
+  return {
+    zepto: {
+      ...zeptoCounts,
+      oldestWaitingAgeMs: zeptoOldestAgeMs,
+      concurrency: ZEPTO_CONCURRENCY,
+      breaker: {
+        ...normalizeBreaker("zepto"),
+      },
+    },
+    zoho: {
+      ...zohoCounts,
+      oldestWaitingAgeMs: zohoOldestAgeMs,
+      concurrency: ZOHO_CONCURRENCY,
+      breaker: {
+        ...normalizeBreaker("zoho"),
+      },
+    },
+  };
+}
+
+const zeptoWorker = new Worker(
+  ZEPTO_QUEUE_NAME,
   async (job) => {
     const payload = {
       ...job.data,
       jobId: job.id,
-    };
-
-    const providerState = providerLimiterState[payload.provider] || {
-      active: 0,
-      limit: 0,
-      waiters: [],
+      provider: "zepto",
     };
 
     console.log(
-      `[WORKER][${job.id}] Processing | route=${payload.routeName} | provider=${payload.provider} | attempt=${job.attemptsMade + 1}/${JOB_ATTEMPTS} | providerActive=${providerState.active}/${providerState.limit}`
+      `[WORKER][ZEPTO][${job.id}] Processing | attempt=${job.attemptsMade + 1}/${JOB_ATTEMPTS}`
     );
 
-    await sendEmail(payload);
+    await sendViaZeptoMail(payload);
 
-    console.log(`[WORKER][${job.id}] Sent`);
+    metrics.completed.zepto++;
+    metrics.lastSentAt.zepto = new Date().toISOString();
+
+    console.log(`[WORKER][ZEPTO][${job.id}] Sent`);
   },
   {
     connection: redisConnection.duplicate(),
-    concurrency: WORKER_CONCURRENCY,
+    concurrency: ZEPTO_CONCURRENCY,
   }
 );
 
-worker.on("failed", (job, err) => {
+const zohoWorker = new Worker(
+  ZOHO_QUEUE_NAME,
+  async (job) => {
+    const payload = {
+      ...job.data,
+      jobId: job.id,
+      provider: "zoho",
+    };
+
+    console.log(
+      `[WORKER][ZOHO][${job.id}] Processing | attempt=${job.attemptsMade + 1}/${JOB_ATTEMPTS}`
+    );
+
+    await sendViaZohoMailApi(payload);
+
+    metrics.completed.zoho++;
+    metrics.lastSentAt.zoho = new Date().toISOString();
+
+    console.log(`[WORKER][ZOHO][${job.id}] Sent`);
+  },
+  {
+    connection: redisConnection.duplicate(),
+    concurrency: ZOHO_CONCURRENCY,
+  }
+);
+
+zeptoWorker.on("failed", (job, err) => {
+  metrics.failed.zepto++;
+  metrics.lastFailureAt.zepto = new Date().toISOString();
+
   console.error(
-    `[WORKER][${job?.id}] Failed | attemptsMade=${job?.attemptsMade} | ${err?.message || err}`
+    `[WORKER][ZEPTO][${job?.id}] Failed | attemptsMade=${job?.attemptsMade} | ${err?.message || err}`
   );
 });
 
-worker.on("completed", (job) => {
-  console.log(`[WORKER][${job.id}] Completed`);
+zohoWorker.on("failed", (job, err) => {
+  metrics.failed.zoho++;
+  metrics.lastFailureAt.zoho = new Date().toISOString();
+
+  console.error(
+    `[WORKER][ZOHO][${job?.id}] Failed | attemptsMade=${job?.attemptsMade} | ${err?.message || err}`
+  );
 });
 
-queueEvents.on("failed", ({ jobId, failedReason }) => {
-  console.error(`[QUEUE][${jobId}] Final failure | ${failedReason}`);
+zeptoQueueEvents.on("failed", ({ jobId, failedReason }) => {
+  console.error(`[QUEUE][ZEPTO][${jobId}] Final failure | ${failedReason}`);
 });
 
-queueEvents.on("completed", ({ jobId }) => {
-  console.log(`[QUEUE][${jobId}] Completed`);
+zohoQueueEvents.on("failed", ({ jobId, failedReason }) => {
+  console.error(`[QUEUE][ZOHO][${jobId}] Final failure | ${failedReason}`);
 });
 
 const server = new SMTPServer({
@@ -552,7 +824,7 @@ const server = new SMTPServer({
         references: Array.isArray(references) ? references.join(" ") : references,
       });
 
-      const job = await enqueueSend({
+      const { job, provider } = await enqueueSend({
         from,
         to,
         subject,
@@ -562,13 +834,85 @@ const server = new SMTPServer({
         messageId,
       });
 
-      console.log(`[MAIL] Accepted and queued as job ${job.id}`);
+      metrics.accepted++;
+      metrics.lastAcceptedAt = new Date().toISOString();
+
+      console.log(
+        `[MAIL] Accepted and queued as ${provider.toUpperCase()} job ${job.id}`
+      );
+
       callback();
     } catch (err) {
+      metrics.rejected++;
+      metrics.smtpErrors++;
+
       console.error("[MAIL] SMTP relay error:", err?.message || err);
       callback(err);
     }
   },
+});
+
+const monitorServer = http.createServer(async (req, res) => {
+  try {
+    const url = req.url || "/";
+
+    if (url === "/health") {
+      const snapshot = await getQueueSnapshot();
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          {
+            ok: true,
+            uptimeSec: Math.round(process.uptime()),
+            queues: snapshot,
+            lastAcceptedAt: metrics.lastAcceptedAt,
+            lastSentAt: metrics.lastSentAt,
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    if (url === "/queue") {
+      const snapshot = await getQueueSnapshot();
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(snapshot, null, 2));
+      return;
+    }
+
+    if (url === "/metrics") {
+      const snapshot = await getQueueSnapshot();
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          {
+            uptimeSec: Math.round(process.uptime()),
+            metrics,
+            queues: snapshot,
+            routeRules: ROUTE_RULES,
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  } catch (err) {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: err?.message || String(err),
+      })
+    );
+  }
 });
 
 async function shutdown(signal) {
@@ -579,15 +923,31 @@ async function shutdown(signal) {
   } catch {}
 
   try {
-    await worker.close();
+    monitorServer.close();
   } catch {}
 
   try {
-    await queueEvents.close();
+    await zeptoWorker.close();
   } catch {}
 
   try {
-    await queue.close();
+    await zohoWorker.close();
+  } catch {}
+
+  try {
+    await zeptoQueueEvents.close();
+  } catch {}
+
+  try {
+    await zohoQueueEvents.close();
+  } catch {}
+
+  try {
+    await zeptoQueue.close();
+  } catch {}
+
+  try {
+    await zohoQueue.close();
   } catch {}
 
   try {
@@ -602,9 +962,18 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] SMTP relay listening on port", PORT);
-  console.log("[BOOT] WORKER_CONCURRENCY =", WORKER_CONCURRENCY);
+  console.log("[BOOT] MONITOR_PORT =", MONITOR_PORT);
+  console.log("[BOOT] ZEPTO_QUEUE_NAME =", ZEPTO_QUEUE_NAME);
+  console.log("[BOOT] ZOHO_QUEUE_NAME =", ZOHO_QUEUE_NAME);
   console.log("[BOOT] ZEPTO_CONCURRENCY =", ZEPTO_CONCURRENCY);
   console.log("[BOOT] ZOHO_CONCURRENCY =", ZOHO_CONCURRENCY);
-  console.log("[BOOT] QUEUE_NAME =", QUEUE_NAME);
+  console.log("[BOOT] BREAKER_FAILURE_THRESHOLD =", BREAKER_FAILURE_THRESHOLD);
+  console.log("[BOOT] BREAKER_WINDOW_MS =", BREAKER_WINDOW_MS);
+  console.log("[BOOT] BREAKER_OPEN_MS =", BREAKER_OPEN_MS);
   console.log("[BOOT] ROUTE_RULES =", JSON.stringify(ROUTE_RULES));
+});
+
+monitorServer.listen(MONITOR_PORT, "0.0.0.0", () => {
+  console.log("[BOOT] Monitor server listening on port", MONITOR_PORT);
+  console.log("[BOOT] Health endpoints: /health /queue /metrics");
 });
