@@ -1,36 +1,10 @@
-import net from "net";
-
-if (process.env.TEST_SMTP === "true") {
-  const socket = net.createConnection(587, "smtppro.zoho.eu");
-
-  socket.setTimeout(5000);
-
-  socket.on("connect", () => {
-    console.log("SMTP CONNECTION SUCCESS");
-    socket.end();
-    process.exit(0);
-  });
-
-  socket.on("timeout", () => {
-    console.log("SMTP CONNECTION TIMEOUT");
-    process.exit(1);
-  });
-
-  socket.on("error", (err) => {
-    console.log("SMTP CONNECTION ERROR:", err.message);
-    process.exit(1);
-  });
-}
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
-import nodemailer from "nodemailer";
 
 const PORT = Number(process.env.PORT || 2525);
 const ZEPTO_API_URL = process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
 const ZEPTOMAIL_TOKEN = process.env.ZEPTOMAIL_TOKEN;
 const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASS = process.env.SMTP_PASS;
 
 const MAX_CONCURRENT_SENDS = Number(process.env.MAX_CONCURRENT_SENDS || 10);
 const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
@@ -53,12 +27,6 @@ const SIGNATURE_DOMAINS = [
   "www.hikecare.co.uk"
 ];
 
-const ZOHO_SMTP_HOST = process.env.ZOHO_SMTP_HOST || "smtppro.zoho.eu";
-const ZOHO_SMTP_PORT = Number(process.env.ZOHO_SMTP_PORT || 465);
-const ZOHO_SMTP_USER = process.env.ZOHO_SMTP_USER;
-const ZOHO_SMTP_PASS = process.env.ZOHO_SMTP_PASS;
-const ZOHO_FROM_FALLBACK = process.env.ZOHO_FROM_FALLBACK || "";
-
 const NL_FALLBACK_DOMAINS = [
   "ziggo.nl",
   "ziggo.com",
@@ -67,27 +35,21 @@ const NL_FALLBACK_DOMAINS = [
   "planet.nl"
 ];
 
+const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID;
+const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
+const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
+const ZOHO_ACCOUNT_ID = process.env.ZOHO_ACCOUNT_ID;
+const ZOHO_FROM_FALLBACK = process.env.ZOHO_FROM_FALLBACK || "";
+
 if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
 if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
-if (!ZOHO_SMTP_USER || !ZOHO_SMTP_PASS) throw new Error("Missing env vars: ZOHO_SMTP_USER / ZOHO_SMTP_PASS");
+if (!ZOHO_CLIENT_ID || !ZOHO_CLIENT_SECRET || !ZOHO_REFRESH_TOKEN || !ZOHO_ACCOUNT_ID) {
+  throw new Error("Missing Zoho Mail API env vars");
+}
 
 const queue = [];
 let activeSends = 0;
 let jobIdCounter = 0;
-
-const zohoTransport = nodemailer.createTransport({
-  host: ZOHO_SMTP_HOST,
-  port: 587,
-  secure: false,
-  auth: {
-    user: ZOHO_SMTP_USER,
-    pass: ZOHO_SMTP_PASS
-  },
-  requireTLS: true,
-  connectionTimeout: SEND_TIMEOUT_MS,
-  greetingTimeout: SEND_TIMEOUT_MS,
-  socketTimeout: SEND_TIMEOUT_MS
-});
 
 function getDomain(email = "") {
   const parts = String(email).toLowerCase().trim().split("@");
@@ -100,8 +62,7 @@ function isAllowedDomain(email = "") {
 }
 
 function shouldUseZohoFallback(recipientEmail = "") {
-  const domain = getDomain(recipientEmail);
-  return NL_FALLBACK_DOMAINS.includes(domain);
+  return NL_FALLBACK_DOMAINS.includes(getDomain(recipientEmail));
 }
 
 function escapeHtml(str = "") {
@@ -132,6 +93,90 @@ function cleanText(text = "") {
   }
 
   return String(text || "").trim();
+}
+
+async function getZohoAccessToken() {
+  const params = new URLSearchParams({
+    refresh_token: ZOHO_REFRESH_TOKEN,
+    client_id: ZOHO_CLIENT_ID,
+    client_secret: ZOHO_CLIENT_SECRET,
+    grant_type: "refresh_token"
+  });
+
+  const res = await fetch("https://accounts.zoho.eu/oauth/v2/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: params.toString()
+  });
+
+  const raw = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`Zoho token error ${res.status}: ${raw}`);
+  }
+
+  const data = JSON.parse(raw);
+
+  if (!data.access_token) {
+    throw new Error(`Zoho token missing access_token: ${raw}`);
+  }
+
+  return data.access_token;
+}
+
+async function sendViaZohoMailApi({ from, to, subject, textBody, jobId }) {
+  const accessToken = await getZohoAccessToken();
+  const safeText = textBody && textBody.trim() ? textBody : " ";
+  const actualFrom = ZOHO_FROM_FALLBACK || from;
+
+  const payload = {
+    fromAddress: actualFrom,
+    toAddress: to,
+    subject: subject || "Support Reply",
+    content: safeText,
+    mailFormat: "plaintext"
+  };
+
+  for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(`https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Zoho-oauthtoken ${accessToken}`,
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+
+      const raw = await res.text();
+
+      console.log(`[ZOHO-API][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${actualFrom} -> ${to} | ${subject}`);
+
+      if (!res.ok) {
+        const err = new Error(`Zoho Mail API error ${res.status}: ${raw}`);
+        err.status = res.status;
+        err.raw = raw;
+
+        if (attempt < RETRY_COUNT && shouldRetry(res.status, raw)) {
+          await sleep(RETRY_DELAY_MS * attempt);
+          continue;
+        }
+
+        throw err;
+      }
+
+      return raw;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 async function sendViaZeptoMail({ from, to, subject, textBody, jobId }) {
@@ -170,7 +215,7 @@ async function sendViaZeptoMail({ from, to, subject, textBody, jobId }) {
 
       const raw = await res.text();
 
-      console.log(`[ZEPTO][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${from} -> ${to}`);
+      console.log(`[ZEPTO][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`);
 
       if (!res.ok) {
         const err = new Error(`ZeptoMail error ${res.status}: ${raw}`);
@@ -192,40 +237,11 @@ async function sendViaZeptoMail({ from, to, subject, textBody, jobId }) {
   }
 }
 
-async function sendViaZohoMail({ from, to, subject, textBody, jobId }) {
-  const safeText = textBody && textBody.trim() ? textBody : " ";
-  const smtpFrom = ZOHO_FROM_FALLBACK || from;
-
-  for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
-    try {
-      const info = await zohoTransport.sendMail({
-        from: smtpFrom,
-        to,
-        subject: subject || "Support Reply",
-        text: safeText,
-        html: `<pre>${escapeHtml(safeText)}</pre>`
-      });
-
-      console.log(`[ZOHO][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> OK | ${smtpFrom} -> ${to} | ${info.messageId || "no-message-id"}`);
-      return info;
-    } catch (err) {
-      const msg = err?.message || String(err);
-      console.warn(`[ZOHO][${jobId}] Attempt ${attempt}/${RETRY_COUNT} failed: ${msg}`);
-
-      if (attempt < RETRY_COUNT && shouldRetry(0, msg)) {
-        await sleep(RETRY_DELAY_MS * attempt);
-        continue;
-      }
-
-      throw err;
-    }
-  }
-}
-
 async function sendEmail(job) {
   if (shouldUseZohoFallback(job.to)) {
-    return sendViaZohoMail(job);
+    return sendViaZohoMailApi(job);
   }
+
   return sendViaZeptoMail(job);
 }
 
@@ -254,7 +270,7 @@ function enqueueSend(data) {
   return new Promise((resolve, reject) => {
     const id = ++jobIdCounter;
     queue.push({ id, data: { ...data, jobId: id }, resolve, reject });
-    console.log(`[QUEUE][${id}] Enqueued | route=${shouldUseZohoFallback(data.to) ? "zoho" : "zepto"} | active=${activeSends} queued=${queue.length}`);
+    console.log(`[QUEUE][${id}] Enqueued | route=${shouldUseZohoFallback(data.to) ? "zoho-api" : "zepto"} | active=${activeSends} queued=${queue.length}`);
     processQueue();
   });
 }
@@ -308,7 +324,7 @@ const server = new SMTPServer({
       const cleanedText = cleanText(rawText);
 
       console.log("[CLEAN] text before/after:", rawText.length, "->", cleanedText.length);
-      console.log("[ROUTE]", shouldUseZohoFallback(to) ? "ZOHO SMTP fallback" : "ZEPTOMAIL API", "| recipient =", to);
+      console.log("[ROUTE]", shouldUseZohoFallback(to) ? "ZOHO MAIL API" : "ZEPTOMAIL", "| recipient =", to);
 
       await enqueueSend({
         from,
@@ -328,6 +344,5 @@ const server = new SMTPServer({
 server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] SMTP relay listening on port", PORT);
   console.log("[BOOT] MAX_CONCURRENT_SENDS =", MAX_CONCURRENT_SENDS);
-  console.log("[BOOT] ZOHO SMTP HOST =", ZOHO_SMTP_HOST);
   console.log("[BOOT] NL fallback domains =", NL_FALLBACK_DOMAINS.join(", "));
 });
