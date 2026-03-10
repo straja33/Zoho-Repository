@@ -1,7 +1,7 @@
 {
   "name": "zoho-smtp-relay",
   "version": "1.0.0",
-  "description": "SMTP relay for Re:amaze → ZeptoMail",
+  "description": "SMTP relay for Re:amaze with ZeptoMail + Zoho SMTP fallback",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "mailparser": "^3.7.2",
+    "nodemailer": "^6.9.16",
     "smtp-server": "^3.13.6"
   }
 }
