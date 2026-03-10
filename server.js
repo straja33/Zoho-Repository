@@ -168,7 +168,15 @@ async function getZohoAccessToken() {
   return zohoAccessToken;
 }
 
-async function sendViaZohoMailApi({ from, to, subject, textBody, jobId }) {
+async function sendViaZohoMailApi({
+  from,
+  to,
+  subject,
+  textBody,
+  jobId,
+  inReplyTo,
+  references
+}) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
   const zohoRoute = getZohoRoute(to);
   const actualFrom = zohoRoute?.fromAddress || ZOHO_FROM_FALLBACK || from;
@@ -187,6 +195,9 @@ async function sendViaZohoMailApi({ from, to, subject, textBody, jobId }) {
         content: safeText,
         mailFormat: "plaintext"
       };
+
+      if (inReplyTo) payload.inReplyTo = inReplyTo;
+      if (references) payload.references = Array.isArray(references) ? references.join(" ") : references;
 
       const res = await fetch(`https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages`, {
         method: "POST",
@@ -230,7 +241,15 @@ async function sendViaZohoMailApi({ from, to, subject, textBody, jobId }) {
   }
 }
 
-async function sendViaZeptoMail({ from, to, subject, textBody, jobId }) {
+async function sendViaZeptoMail({
+  from,
+  to,
+  subject,
+  textBody,
+  jobId,
+  inReplyTo,
+  references
+}) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
 
   const payload = {
@@ -248,6 +267,13 @@ async function sendViaZeptoMail({ from, to, subject, textBody, jobId }) {
     textbody: safeText,
     htmlbody: `<pre>${escapeHtml(safeText)}</pre>`
   };
+
+  const headers = {};
+  if (inReplyTo) headers["In-Reply-To"] = inReplyTo;
+  if (references) headers["References"] = Array.isArray(references) ? references.join(" ") : references;
+  if (Object.keys(headers).length > 0) {
+    payload.headers = headers;
+  }
 
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
     const controller = new AbortController();
@@ -338,7 +364,10 @@ function summarize(parsed) {
     hasText: !!parsed.text,
     hasHtml: !!parsed.html,
     textLength: parsed.text?.length || 0,
-    htmlLength: typeof parsed.html === "string" ? parsed.html.length : 0
+    htmlLength: typeof parsed.html === "string" ? parsed.html.length : 0,
+    messageId: parsed.messageId || "",
+    inReplyTo: parsed.inReplyTo || "",
+    references: parsed.references || []
   };
 }
 
@@ -368,6 +397,10 @@ const server = new SMTPServer({
       const to = parsedTo;
       const subject = parsed.subject || "Support Reply";
 
+      const inReplyTo = parsed.inReplyTo || "";
+      const references = parsed.references || [];
+      const messageId = parsed.messageId || "";
+
       if (!from) throw new Error("Missing FROM address");
       if (!to) throw new Error("Missing TO address");
 
@@ -381,12 +414,20 @@ const server = new SMTPServer({
 
       console.log("[CLEAN] text before/after:", rawText.length, "->", cleanedText.length);
       console.log("[ROUTE]", zohoRoute ? zohoRoute.route.toUpperCase() : "ZEPTOMAIL", "| recipient =", to);
+      console.log("[THREAD]", {
+        messageId,
+        inReplyTo,
+        references: Array.isArray(references) ? references.join(" ") : references
+      });
 
       await enqueueSend({
         from,
         to,
         subject,
-        textBody: cleanedText
+        textBody: cleanedText,
+        inReplyTo,
+        references,
+        messageId
       });
 
       callback();
