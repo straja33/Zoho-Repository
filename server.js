@@ -37,11 +37,17 @@ const NL_FALLBACK_DOMAINS = [
   "planet.nl"
 ];
 
+const UK_FALLBACK_DOMAINS = [
+  "ntlworld.com"
+];
+
 const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID;
 const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
 const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
 const ZOHO_ACCOUNT_ID = process.env.ZOHO_ACCOUNT_ID;
+
 const ZOHO_FROM_FALLBACK = process.env.ZOHO_FROM_FALLBACK || "";
+const ZOHO_FROM_FALLBACK_UK = process.env.ZOHO_FROM_FALLBACK_UK || "";
 
 if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
 if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
@@ -53,7 +59,6 @@ const queue = [];
 let activeSends = 0;
 let jobIdCounter = 0;
 
-// Zoho token cache
 let zohoAccessToken = null;
 let zohoTokenExpiry = 0;
 
@@ -67,8 +72,28 @@ function isAllowedDomain(email = "") {
   return ALLOWED_DOMAINS.includes(getDomain(email));
 }
 
+function getZohoRoute(recipientEmail = "") {
+  const domain = getDomain(recipientEmail);
+
+  if (NL_FALLBACK_DOMAINS.includes(domain)) {
+    return {
+      route: "zoho-nl",
+      fromAddress: ZOHO_FROM_FALLBACK
+    };
+  }
+
+  if (UK_FALLBACK_DOMAINS.includes(domain)) {
+    return {
+      route: "zoho-uk",
+      fromAddress: ZOHO_FROM_FALLBACK_UK
+    };
+  }
+
+  return null;
+}
+
 function shouldUseZohoFallback(recipientEmail = "") {
-  return NL_FALLBACK_DOMAINS.includes(getDomain(recipientEmail));
+  return !!getZohoRoute(recipientEmail);
 }
 
 function escapeHtml(str = "") {
@@ -145,7 +170,8 @@ async function getZohoAccessToken() {
 
 async function sendViaZohoMailApi({ from, to, subject, textBody, jobId }) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
-  const actualFrom = ZOHO_FROM_FALLBACK || from;
+  const zohoRoute = getZohoRoute(to);
+  const actualFrom = zohoRoute?.fromAddress || ZOHO_FROM_FALLBACK || from;
 
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
     const controller = new AbortController();
@@ -175,10 +201,11 @@ async function sendViaZohoMailApi({ from, to, subject, textBody, jobId }) {
 
       const raw = await res.text();
 
-      console.log(`[ZOHO-API][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${actualFrom} -> ${to} | ${subject}`);
+      console.log(
+        `[ZOHO-API][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | route=${zohoRoute?.route || "zoho"} | ${actualFrom} -> ${to} | ${subject}`
+      );
 
       if (!res.ok) {
-        // invalidate cached token on auth errors
         if (res.status === 401 || res.status === 400) {
           zohoAccessToken = null;
           zohoTokenExpiry = 0;
@@ -293,8 +320,12 @@ function processQueue() {
 function enqueueSend(data) {
   return new Promise((resolve, reject) => {
     const id = ++jobIdCounter;
+    const zohoRoute = getZohoRoute(data.to);
+
     queue.push({ id, data: { ...data, jobId: id }, resolve, reject });
-    console.log(`[QUEUE][${id}] Enqueued | route=${shouldUseZohoFallback(data.to) ? "zoho-api" : "zepto"} | active=${activeSends} queued=${queue.length}`);
+    console.log(
+      `[QUEUE][${id}] Enqueued | route=${zohoRoute ? zohoRoute.route : "zepto"} | active=${activeSends} queued=${queue.length}`
+    );
     processQueue();
   });
 }
@@ -346,9 +377,10 @@ const server = new SMTPServer({
 
       const rawText = parsed.text || "";
       const cleanedText = cleanText(rawText);
+      const zohoRoute = getZohoRoute(to);
 
       console.log("[CLEAN] text before/after:", rawText.length, "->", cleanedText.length);
-      console.log("[ROUTE]", shouldUseZohoFallback(to) ? "ZOHO MAIL API" : "ZEPTOMAIL", "| recipient =", to);
+      console.log("[ROUTE]", zohoRoute ? zohoRoute.route.toUpperCase() : "ZEPTOMAIL", "| recipient =", to);
 
       await enqueueSend({
         from,
@@ -369,4 +401,5 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] SMTP relay listening on port", PORT);
   console.log("[BOOT] MAX_CONCURRENT_SENDS =", MAX_CONCURRENT_SENDS);
   console.log("[BOOT] NL fallback domains =", NL_FALLBACK_DOMAINS.join(", "));
+  console.log("[BOOT] UK fallback domains =", UK_FALLBACK_DOMAINS.join(", "));
 });
