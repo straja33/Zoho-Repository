@@ -608,4 +608,3 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] QUEUE_NAME =", QUEUE_NAME);
   console.log("[BOOT] ROUTE_RULES =", JSON.stringify(ROUTE_RULES));
 });
-EOF
