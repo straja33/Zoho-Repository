@@ -1,3 +1,26 @@
+import net from "net";
+
+if (process.env.TEST_SMTP === "true") {
+  const socket = net.createConnection(587, "smtppro.zoho.eu");
+
+  socket.setTimeout(5000);
+
+  socket.on("connect", () => {
+    console.log("SMTP CONNECTION SUCCESS");
+    socket.end();
+    process.exit(0);
+  });
+
+  socket.on("timeout", () => {
+    console.log("SMTP CONNECTION TIMEOUT");
+    process.exit(1);
+  });
+
+  socket.on("error", (err) => {
+    console.log("SMTP CONNECTION ERROR:", err.message);
+    process.exit(1);
+  });
+}
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
 import nodemailer from "nodemailer";
