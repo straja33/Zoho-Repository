@@ -268,13 +268,6 @@ async function sendViaZeptoMail({
     htmlbody: `<pre>${escapeHtml(safeText)}</pre>`
   };
 
-  const headers = {};
-  if (inReplyTo) headers["In-Reply-To"] = inReplyTo;
-  if (references) headers["References"] = Array.isArray(references) ? references.join(" ") : references;
-  if (Object.keys(headers).length > 0) {
-    payload.headers = headers;
-  }
-
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
