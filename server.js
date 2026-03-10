@@ -55,7 +55,6 @@ function cleanText(text = "") {
   const lines = String(text || "").split(/\r?\n/);
 
   const quoteMarkers = [
-    /^--$/,
     /^On .+ wrote:$/i,
     /^Am .+ schrieb .+:?$/i,
     /^[- ]*Original Message[- ]*$/i,
@@ -116,7 +115,7 @@ function cleanHtml(html = "") {
   return out.trim();
 }
 
-async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, jobId }) {
+async function sendToZeptoMail({ from, to, subject, textBody, jobId }) {
   const payload = {
     from: {
       address: from
@@ -273,8 +272,7 @@ const server = new SMTPServer({
         from,
         to,
         subject,
-        textBody: cleanedText,
-        htmlBody: cleanedHtml
+        textBody: cleanedText
       });
 
       callback();
