@@ -1,6 +1,5 @@
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
-import { SendMailClient } from "zeptomail";
 
 const PORT = Number(process.env.PORT || 2525);
 const ZEPTO_API_URL = process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
@@ -18,11 +17,6 @@ const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
 if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
 if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
 if (!BOUNCE_ADDRESS) throw new Error("Missing env var: BOUNCE_ADDRESS");
-
-const zepto = new SendMailClient({
-  url: ZEPTO_API_URL,
-  token: ZEPTOMAIL_TOKEN
-});
 
 function getDomain(email = "") {
   const parts = String(email).toLowerCase().trim().split("@");
@@ -140,17 +134,25 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody }) {
   console.log("[ZEPTO] URL:", ZEPTO_API_URL);
   console.log("[ZEPTO] Payload:", JSON.stringify(payload, null, 2));
 
-  try {
-    const resp = await zepto.sendMail(payload);
-    console.log("[ZEPTO] Success:", JSON.stringify(resp, null, 2));
-    return resp;
-  } catch (error) {
-    console.error("[ZEPTO] Error object:", error?.message || error);
-    if (error?.response) {
-      console.error("[ZEPTO] Error response:", JSON.stringify(error.response, null, 2));
-    }
-    throw error;
+  const res = await fetch(ZEPTO_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": ZEPTOMAIL_TOKEN
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const raw = await res.text();
+
+  console.log("[ZEPTO] Status:", res.status);
+  console.log("[ZEPTO] Raw response:", raw);
+
+  if (!res.ok) {
+    throw new Error(`ZeptoMail error ${res.status}: ${raw}`);
   }
+
+  return raw;
 }
 
 const server = new SMTPServer({
