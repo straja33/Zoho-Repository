@@ -29,25 +29,31 @@ const SIGNATURE_DOMAINS = [
   "www.hikecare.co.uk"
 ];
 
-const NL_FALLBACK_DOMAINS = [
-  "ziggo.nl",
-  "ziggo.com",
-  "upcmail.nl",
-  "chello.nl",
-  "planet.nl"
-];
+const ROUTE_RULES = (() => {
+  try {
+    const parsed = JSON.parse(process.env.ROUTE_RULES_JSON || "[]");
 
-const UK_FALLBACK_DOMAINS = [
-  "ntlworld.com"
-];
+    if (!Array.isArray(parsed)) {
+      throw new Error("ROUTE_RULES_JSON must be an array");
+    }
+
+    return parsed.map((rule) => ({
+      name: String(rule.name || "unnamed-route").trim(),
+      provider: String(rule.provider || "zepto").trim().toLowerCase(),
+      fromAddress: String(rule.fromAddress || "").trim(),
+      domains: Array.isArray(rule.domains)
+        ? rule.domains.map((d) => String(d).trim().toLowerCase()).filter(Boolean)
+        : []
+    }));
+  } catch (err) {
+    throw new Error(`Invalid ROUTE_RULES_JSON: ${err.message}`);
+  }
+})();
 
 const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID;
 const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
 const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
 const ZOHO_ACCOUNT_ID = process.env.ZOHO_ACCOUNT_ID;
-
-const ZOHO_FROM_FALLBACK = process.env.ZOHO_FROM_FALLBACK || "";
-const ZOHO_FROM_FALLBACK_UK = process.env.ZOHO_FROM_FALLBACK_UK || "";
 
 if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
 if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
@@ -72,28 +78,24 @@ function isAllowedDomain(email = "") {
   return ALLOWED_DOMAINS.includes(getDomain(email));
 }
 
-function getZohoRoute(recipientEmail = "") {
+function getRoute(recipientEmail = "") {
   const domain = getDomain(recipientEmail);
 
-  if (NL_FALLBACK_DOMAINS.includes(domain)) {
-    return {
-      route: "zoho-nl",
-      fromAddress: ZOHO_FROM_FALLBACK
-    };
+  for (const rule of ROUTE_RULES) {
+    if (rule.domains.includes(domain)) {
+      return rule;
+    }
   }
 
-  if (UK_FALLBACK_DOMAINS.includes(domain)) {
-    return {
-      route: "zoho-uk",
-      fromAddress: ZOHO_FROM_FALLBACK_UK
-    };
-  }
-
-  return null;
+  return {
+    name: "zepto-default",
+    provider: "zepto",
+    fromAddress: ""
+  };
 }
 
 function shouldUseZohoFallback(recipientEmail = "") {
-  return !!getZohoRoute(recipientEmail);
+  return getRoute(recipientEmail).provider === "zoho";
 }
 
 function escapeHtml(str = "") {
@@ -178,8 +180,8 @@ async function sendViaZohoMailApi({
   references
 }) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
-  const zohoRoute = getZohoRoute(to);
-  const actualFrom = zohoRoute?.fromAddress || ZOHO_FROM_FALLBACK || from;
+  const route = getRoute(to);
+  const actualFrom = route.fromAddress || from;
 
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
     const controller = new AbortController();
@@ -202,9 +204,9 @@ async function sendViaZohoMailApi({
       const res = await fetch(`https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages`, {
         method: "POST",
         headers: {
-          "Authorization": `Zoho-oauthtoken ${accessToken}`,
+          Authorization: `Zoho-oauthtoken ${accessToken}`,
           "Content-Type": "application/json",
-          "Accept": "application/json"
+          Accept: "application/json"
         },
         body: JSON.stringify(payload),
         signal: controller.signal
@@ -213,7 +215,7 @@ async function sendViaZohoMailApi({
       const raw = await res.text();
 
       console.log(
-        `[ZOHO-API][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | route=${zohoRoute?.route || "zoho"} | ${actualFrom} -> ${to} | ${subject}`
+        `[ZOHO-API][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | route=${route.name} | ${actualFrom} -> ${to} | ${subject}`
       );
 
       if (!res.ok) {
@@ -246,9 +248,7 @@ async function sendViaZeptoMail({
   to,
   subject,
   textBody,
-  jobId,
-  inReplyTo,
-  references
+  jobId
 }) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
 
@@ -277,7 +277,7 @@ async function sendViaZeptoMail({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": ZEPTOMAIL_TOKEN
+          Authorization: ZEPTOMAIL_TOKEN
         },
         body: JSON.stringify(payload),
         signal: controller.signal
@@ -285,7 +285,9 @@ async function sendViaZeptoMail({
 
       const raw = await res.text();
 
-      console.log(`[ZEPTO][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`);
+      console.log(
+        `[ZEPTO][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`
+      );
 
       if (!res.ok) {
         const err = new Error(`ZeptoMail error ${res.status}: ${raw}`);
@@ -339,12 +341,19 @@ function processQueue() {
 function enqueueSend(data) {
   return new Promise((resolve, reject) => {
     const id = ++jobIdCounter;
-    const zohoRoute = getZohoRoute(data.to);
+    const route = getRoute(data.to);
 
-    queue.push({ id, data: { ...data, jobId: id }, resolve, reject });
+    queue.push({
+      id,
+      data: { ...data, jobId: id },
+      resolve,
+      reject
+    });
+
     console.log(
-      `[QUEUE][${id}] Enqueued | route=${zohoRoute ? zohoRoute.route : "zepto"} | active=${activeSends} queued=${queue.length}`
+      `[QUEUE][${id}] Enqueued | route=${route.name} | provider=${route.provider} | active=${activeSends} queued=${queue.length}`
     );
+
     processQueue();
   });
 }
@@ -403,10 +412,10 @@ const server = new SMTPServer({
 
       const rawText = parsed.text || "";
       const cleanedText = cleanText(rawText);
-      const zohoRoute = getZohoRoute(to);
+      const route = getRoute(to);
 
       console.log("[CLEAN] text before/after:", rawText.length, "->", cleanedText.length);
-      console.log("[ROUTE]", zohoRoute ? zohoRoute.route.toUpperCase() : "ZEPTOMAIL", "| recipient =", to);
+      console.log("[ROUTE]", route.name.toUpperCase(), "| provider =", route.provider, "| recipient =", to);
       console.log("[THREAD]", {
         messageId,
         inReplyTo,
@@ -434,6 +443,5 @@ const server = new SMTPServer({
 server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] SMTP relay listening on port", PORT);
   console.log("[BOOT] MAX_CONCURRENT_SENDS =", MAX_CONCURRENT_SENDS);
-  console.log("[BOOT] NL fallback domains =", NL_FALLBACK_DOMAINS.join(", "));
-  console.log("[BOOT] UK fallback domains =", UK_FALLBACK_DOMAINS.join(", "));
+  console.log("[BOOT] ROUTE_RULES =", JSON.stringify(ROUTE_RULES));
 });
