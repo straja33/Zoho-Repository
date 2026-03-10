@@ -53,6 +53,10 @@ const queue = [];
 let activeSends = 0;
 let jobIdCounter = 0;
 
+// Zoho token cache
+let zohoAccessToken = null;
+let zohoTokenExpiry = 0;
+
 function getDomain(email = "") {
   const parts = String(email).toLowerCase().trim().split("@");
   return parts.length === 2 ? parts[1] : "";
@@ -98,6 +102,12 @@ function cleanText(text = "") {
 }
 
 async function getZohoAccessToken() {
+  const now = Date.now();
+
+  if (zohoAccessToken && now < zohoTokenExpiry) {
+    return zohoAccessToken;
+  }
+
   const params = new URLSearchParams({
     refresh_token: ZOHO_REFRESH_TOKEN,
     client_id: ZOHO_CLIENT_ID,
@@ -125,27 +135,33 @@ async function getZohoAccessToken() {
     throw new Error(`Zoho token missing access_token: ${raw}`);
   }
 
-  return data.access_token;
+  zohoAccessToken = data.access_token;
+  zohoTokenExpiry = Date.now() + ((data.expires_in || 3600) - 300) * 1000;
+
+  console.log("[ZOHO TOKEN] New access token cached");
+
+  return zohoAccessToken;
 }
 
 async function sendViaZohoMailApi({ from, to, subject, textBody, jobId }) {
-  const accessToken = await getZohoAccessToken();
   const safeText = textBody && textBody.trim() ? textBody : " ";
   const actualFrom = ZOHO_FROM_FALLBACK || from;
-
-  const payload = {
-    fromAddress: actualFrom,
-    toAddress: to,
-    subject: subject || "Support Reply",
-    content: safeText,
-    mailFormat: "plaintext"
-  };
 
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
 
     try {
+      const accessToken = await getZohoAccessToken();
+
+      const payload = {
+        fromAddress: actualFrom,
+        toAddress: to,
+        subject: subject || "Support Reply",
+        content: safeText,
+        mailFormat: "plaintext"
+      };
+
       const res = await fetch(`https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages`, {
         method: "POST",
         headers: {
@@ -162,6 +178,12 @@ async function sendViaZohoMailApi({ from, to, subject, textBody, jobId }) {
       console.log(`[ZOHO-API][${jobId}] Attempt ${attempt}/${RETRY_COUNT} -> ${res.status} | ${actualFrom} -> ${to} | ${subject}`);
 
       if (!res.ok) {
+        // invalidate cached token on auth errors
+        if (res.status === 401 || res.status === 400) {
+          zohoAccessToken = null;
+          zohoTokenExpiry = 0;
+        }
+
         const err = new Error(`Zoho Mail API error ${res.status}: ${raw}`);
         err.status = res.status;
         err.raw = raw;
