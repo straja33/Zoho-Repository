@@ -246,7 +246,7 @@ async function sendViaZohoMailApi({
 
       if (inReplyTo) payload.inReplyTo = inReplyTo;
       if (references) {
-        payload.references = Array.isArray(references)
+        payload.refHeader = Array.isArray(references)
           ? references.join(" ")
           : references;
       }
