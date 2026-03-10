@@ -9,7 +9,6 @@
   },
   "dependencies": {
     "mailparser": "^3.7.2",
-    "smtp-server": "^3.13.6",
-    "zeptomail": "^2.0.0"
+    "smtp-server": "^3.13.6"
   }
 }
