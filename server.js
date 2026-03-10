@@ -18,6 +18,17 @@ const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
   .map((d) => d.trim().toLowerCase())
   .filter(Boolean);
 
+const SIGNATURE_DOMAINS = [
+  "www.berg-fit.de",
+  "www.bella-balu.de",
+  "www.gartenort.de",
+  "www.bergaktiv.de",
+  "www.hike-care.com",
+  "www.hikecarewinkel.nl",
+  "www.gardenhomie.com",
+  "www.hikecare.co.uk"
+];
+
 if (!ZEPTOMAIL_TOKEN) throw new Error("Missing env var: ZEPTOMAIL_TOKEN");
 if (!SMTP_USER || !SMTP_PASS) throw new Error("Missing env vars: SMTP_USER / SMTP_PASS");
 
@@ -54,68 +65,20 @@ function shouldRetry(status, message = "") {
 function cleanText(text = "") {
   const lines = String(text || "").split(/\r?\n/);
 
-  const quoteMarkers = [
-    /^On .+ wrote:$/i,
-    /^Am .+ schrieb .+:?$/i,
-    /^[- ]*Original Message[- ]*$/i,
-    /^From:\s.+$/i,
-    /^Sent:\s.+$/i,
-    /^To:\s.+$/i,
-    /^Subject:\s.+$/i,
-  ];
-
-  const marketingMarkers = [
-    /ctrk\.klclick\.com/i,
-    /unsubscribe/i,
-    /manage preferences/i,
-    /view in browser/i,
-    /newsletter/i,
-  ];
-
-  let cutIndex = lines.length;
-  let marketingHits = 0;
-
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
+    const line = lines[i].toLowerCase();
 
-    if (quoteMarkers.some((rx) => rx.test(line))) {
-      cutIndex = i;
-      break;
-    }
-
-    if (marketingMarkers.some((rx) => rx.test(line))) {
-      marketingHits++;
-      if (marketingHits >= 2) {
-        cutIndex = i;
-        break;
-      }
+    if (SIGNATURE_DOMAINS.some((domain) => line.includes(domain))) {
+      return lines.slice(0, i + 1).join("\n").trim();
     }
   }
 
-  return lines.slice(0, cutIndex).join("\n").trim();
-}
-
-function cleanHtml(html = "") {
-  let out = String(html || "");
-
-  const patterns = [
-    /<div[^>]*>\s*On .*?wrote:.*$/is,
-    /<div[^>]*>\s*Am .*?schrieb.*$/is,
-    /-----Original Message-----.*$/is,
-    /ctrk\.klclick\.com.*$/is,
-    /unsubscribe.*$/is,
-    /manage preferences.*$/is,
-    /view in browser.*$/is,
-  ];
-
-  for (const pattern of patterns) {
-    out = out.replace(pattern, "");
-  }
-
-  return out.trim();
+  return String(text || "").trim();
 }
 
 async function sendToZeptoMail({ from, to, subject, textBody, jobId }) {
+  const safeText = textBody && textBody.trim() ? textBody : " ";
+
   const payload = {
     from: {
       address: from
@@ -128,8 +91,8 @@ async function sendToZeptoMail({ from, to, subject, textBody, jobId }) {
       }
     ],
     subject: subject || "Support Reply",
-    textbody: textBody && textBody.trim() ? textBody : " ",
-    htmlbody: `<pre>${escapeHtml(textBody || " ")}</pre>`
+    textbody: safeText,
+    htmlbody: `<pre>${escapeHtml(safeText)}</pre>`
   };
 
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
@@ -259,14 +222,10 @@ const server = new SMTPServer({
       }
 
       const rawText = parsed.text || "";
-      const rawHtml = typeof parsed.html === "string" ? parsed.html : "";
-
       const cleanedText = cleanText(rawText);
-      const cleanedHtml = cleanHtml(rawHtml);
 
       console.log("[CLEAN] text before/after:", rawText.length, "->", cleanedText.length);
-      console.log("[CLEAN] html before/after:", rawHtml.length, "->", cleanedHtml.length);
-      console.log("[CLEAN] html preview:", cleanedHtml.slice(0, 1500));
+      console.log("[CLEAN] text preview:", cleanedText.slice(0, 1500));
 
       await enqueueSend({
         from,
