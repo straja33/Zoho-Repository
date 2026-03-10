@@ -130,9 +130,7 @@ async function sendToZeptoMail({ from, to, subject, textBody, htmlBody, jobId })
     ],
     subject: subject || "Support Reply",
     textbody: textBody && textBody.trim() ? textBody : " ",
-    htmlbody: htmlBody && htmlBody.trim()
-      ? htmlBody
-      : `<pre>${escapeHtml(textBody || " ")}</pre>`
+    htmlbody: `<pre>${escapeHtml(textBody || " ")}</pre>`
   };
 
   for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
@@ -261,8 +259,15 @@ const server = new SMTPServer({
         throw new Error(`Blocked sender domain: ${from}`);
       }
 
-      const cleanedText = cleanText(parsed.text || "");
-      const cleanedHtml = cleanHtml(typeof parsed.html === "string" ? parsed.html : "");
+      const rawText = parsed.text || "";
+      const rawHtml = typeof parsed.html === "string" ? parsed.html : "";
+
+      const cleanedText = cleanText(rawText);
+      const cleanedHtml = cleanHtml(rawHtml);
+
+      console.log("[CLEAN] text before/after:", rawText.length, "->", cleanedText.length);
+      console.log("[CLEAN] html before/after:", rawHtml.length, "->", cleanedHtml.length);
+      console.log("[CLEAN] html preview:", cleanedHtml.slice(0, 1500));
 
       await enqueueSend({
         from,
