@@ -16,8 +16,6 @@ const ZOHO_QUEUE_NAME = process.env.ZOHO_QUEUE_NAME || "smtp-relay-zoho";
 
 const ZEPTO_API_URL =
   process.env.ZEPTO_API_URL || "https://api.zeptomail.com/v1.1/email";
-const ZEPTO_FILES_API_URL =
-  process.env.ZEPTO_FILES_API_URL || "https://api.zeptomail.com/v1.1/files";
 const ZEPTOMAIL_TOKEN = process.env.ZEPTOMAIL_TOKEN;
 
 const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
@@ -1102,12 +1100,13 @@ const server = new SMTPServer({
       const rawText = parsed.text || "";
       const cleanedText = cleanText(rawText);
 
-      const rawHtml =
-        typeof parsed.html === "string"
-          ? parsed.html
-          : cleanedText
-          ? `<pre>${escapeHtml(cleanedText)}</pre>`
-          : "";
+      // FIX:
+      // Never pass original parsed.html, because that can still contain
+      // old marketing/newsletter junk below the signature cut.
+      // Build clean HTML only from already-cleaned text.
+      const cleanedHtml = cleanedText
+        ? `<pre>${escapeHtml(cleanedText)}</pre>`
+        : "";
 
       const attachments = serializeAttachments(parsed.attachments || []);
       const totalAttachmentBytes = validateAttachments(attachments);
@@ -1143,7 +1142,7 @@ const server = new SMTPServer({
         to,
         subject,
         textBody: cleanedText,
-        htmlBody: rawHtml,
+        htmlBody: cleanedHtml,
         inReplyTo,
         references,
         messageId,
