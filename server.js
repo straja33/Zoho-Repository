@@ -1105,12 +1105,9 @@ const server = new SMTPServer({
       const rawText = parsed.text || "";
       const cleanedText = cleanText(rawText);
 
-      const rawHtml = parsed.html || "";
-      let cleanedHtml = rawHtml;
-
-      if (!cleanedHtml && cleanedText) {
-        cleanedHtml = `<p>${escapeHtml(cleanedText).replace(/\n/g, "<br>")}</p>`;
-      }
+      const cleanedHtml = cleanedText
+      ? `<p>${escapeHtml(cleanedText).replace(/\n/g, "<br>")}</p>`
+      : "";
 
       const attachments = serializeAttachments(parsed.attachments || []);
       const totalAttachmentBytes = validateAttachments(attachments);
