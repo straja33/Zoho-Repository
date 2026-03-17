@@ -518,21 +518,26 @@ async function getZohoAccessToken() {
 }
 
 async function uploadZohoAttachment(accessToken, attachment) {
-  const fileName = encodeURIComponent(attachment.filename || "attachment");
-  const url = `https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages/attachments?fileName=${fileName}&isInline=${
-    attachment.contentDisposition === "inline" ? "true" : "false"
-  }`;
+  const isInline = attachment.contentDisposition === "inline" ? "true" : "false";
+  const url =
+    `https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages/attachments` +
+    `?uploadType=multipart&isInline=${isInline}`;
 
   const binary = Buffer.from(attachment.contentBase64, "base64");
+  const blob = new Blob([binary], {
+    type: attachment.contentType || "application/octet-stream",
+  });
+
+  const form = new FormData();
+  form.append("attach", blob, attachment.filename || "attachment");
 
   const res = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Zoho-oauthtoken ${accessToken}`,
-      "Content-Type": attachment.contentType || "application/octet-stream",
       Accept: "application/json",
     },
-    body: binary,
+    body: form,
   });
 
   const raw = await res.text();
@@ -544,7 +549,7 @@ async function uploadZohoAttachment(accessToken, attachment) {
   }
 
   const data = JSON.parse(raw);
-  const item = Array.isArray(data.data) ? data.data[0] : null;
+  const item = Array.isArray(data.data) ? data.data[0] : data.data;
 
   if (!item?.attachmentName || !item?.attachmentPath || !item?.storeName) {
     throw new Error(
@@ -1100,13 +1105,12 @@ const server = new SMTPServer({
       const rawText = parsed.text || "";
       const cleanedText = cleanText(rawText);
 
-      // FIX:
-      // Never pass original parsed.html, because that can still contain
-      // old marketing/newsletter junk below the signature cut.
-      // Build clean HTML only from already-cleaned text.
-      const cleanedHtml = cleanedText
-        ? `<pre>${escapeHtml(cleanedText)}</pre>`
-        : "";
+      const rawHtml = parsed.html || "";
+      let cleanedHtml = rawHtml;
+
+      if (!cleanedHtml && cleanedText) {
+        cleanedHtml = `<p>${escapeHtml(cleanedText).replace(/\n/g, "<br>")}</p>`;
+      }
 
       const attachments = serializeAttachments(parsed.attachments || []);
       const totalAttachmentBytes = validateAttachments(attachments);
