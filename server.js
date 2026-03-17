@@ -7,7 +7,7 @@ import IORedis from "ioredis";
 import http from "http";
 
 const PORT = Number(process.env.PORT || 2525);
-const MONITOR_PORT = Number(process.env.MONITOR_PORT || process.env.PORT || 8080);
+const MONITOR_PORT = Number(process.env.MONITOR_PORT || 8080);
 
 const REDIS_URL = process.env.REDIS_URL;
 
@@ -15,15 +15,17 @@ const ZEPTO_QUEUE_NAME = process.env.ZEPTO_QUEUE_NAME || "smtp-relay-zepto";
 const ZOHO_QUEUE_NAME = process.env.ZOHO_QUEUE_NAME || "smtp-relay-zoho";
 
 const ZEPTO_API_URL =
-  process.env.ZEPTO_API_URL || "https://api.zeptomail.eu/v1.1/email";
+  process.env.ZEPTO_API_URL || "https://api.zeptomail.com/v1.1/email";
+const ZEPTO_FILES_API_URL =
+  process.env.ZEPTO_FILES_API_URL || "https://api.zeptomail.com/v1.1/files";
 const ZEPTOMAIL_TOKEN = process.env.ZEPTOMAIL_TOKEN;
 
 const FROM_FALLBACK = process.env.FROM_FALLBACK || "";
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
-const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 10);
-const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 3);
+const ZEPTO_CONCURRENCY = Number(process.env.ZEPTO_CONCURRENCY || 15);
+const ZOHO_CONCURRENCY = Number(process.env.ZOHO_CONCURRENCY || 5);
 
 const SEND_TIMEOUT_MS = Number(process.env.SEND_TIMEOUT_MS || 20000);
 
@@ -43,6 +45,13 @@ const BREAKER_OPEN_MS = Number(process.env.BREAKER_OPEN_MS || 120000);
 
 const RECENT_EMAILS_KEY = process.env.RECENT_EMAILS_KEY || "smtp-relay:recent";
 const RECENT_EMAILS_LIMIT = Number(process.env.RECENT_EMAILS_LIMIT || 50);
+
+const MAX_ATTACHMENT_BYTES = Number(
+  process.env.MAX_ATTACHMENT_BYTES || 10 * 1024 * 1024
+);
+const MAX_TOTAL_ATTACHMENTS_BYTES = Number(
+  process.env.MAX_TOTAL_ATTACHMENTS_BYTES || 20 * 1024 * 1024
+);
 
 const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || "")
   .split(",")
@@ -161,6 +170,9 @@ const metrics = {
     zoho: 0,
   },
   smtpErrors: 0,
+  attachmentJobs: 0,
+  attachmentFilesSent: 0,
+  attachmentBytesSent: 0,
   lastAcceptedAt: null,
   lastSentAt: {
     zepto: null,
@@ -371,13 +383,79 @@ function safeString(value = "", max = 300) {
   return s.length > max ? `${s.slice(0, max)}...` : s;
 }
 
+function sanitizeFilename(name = "") {
+  return String(name || "attachment")
+    .replace(/[^\w.\-() ]+/g, "_")
+    .slice(0, 180);
+}
+
+function normalizeAttachmentContentType(type = "") {
+  const t = String(type || "").trim();
+  return t || "application/octet-stream";
+}
+
+function estimateBase64Bytes(base64 = "") {
+  return Math.floor((String(base64 || "").length * 3) / 4);
+}
+
+function serializeAttachments(parsedAttachments = []) {
+  return parsedAttachments.map((att, index) => {
+    const filename = sanitizeFilename(att.filename || `attachment-${index + 1}`);
+    const contentBase64 = Buffer.isBuffer(att.content)
+      ? att.content.toString("base64")
+      : Buffer.from(att.content || "").toString("base64");
+
+    return {
+      filename,
+      contentType: normalizeAttachmentContentType(att.contentType),
+      contentDisposition: att.contentDisposition || "attachment",
+      contentId: att.contentId || "",
+      size: Number(att.size || estimateBase64Bytes(contentBase64)),
+      contentBase64,
+    };
+  });
+}
+
+function validateAttachments(attachments = []) {
+  let total = 0;
+
+  for (const att of attachments) {
+    const size = Number(att.size || estimateBase64Bytes(att.contentBase64));
+    total += size;
+
+    if (size > MAX_ATTACHMENT_BYTES) {
+      throw new Error(
+        `Attachment too large: ${att.filename} (${size} bytes > ${MAX_ATTACHMENT_BYTES})`
+      );
+    }
+  }
+
+  if (total > MAX_TOTAL_ATTACHMENTS_BYTES) {
+    throw new Error(
+      `Total attachment size too large: ${total} bytes > ${MAX_TOTAL_ATTACHMENTS_BYTES}`
+    );
+  }
+
+  return total;
+}
+
+function summarizeAttachments(attachments = []) {
+  return attachments.map((att) => ({
+    filename: att.filename,
+    contentType: att.contentType,
+    size: att.size,
+    inline: att.contentDisposition === "inline",
+  }));
+}
+
 async function addRecentEvent(event) {
   const payload = JSON.stringify({
     ...event,
     timestamp: event.timestamp || new Date().toISOString(),
   });
 
-  await redisConnection.multi()
+  await redisConnection
+    .multi()
     .lpush(RECENT_EMAILS_KEY, payload)
     .ltrim(RECENT_EMAILS_KEY, 0, RECENT_EMAILS_LIMIT - 1)
     .exec();
@@ -441,15 +519,61 @@ async function getZohoAccessToken() {
   return zohoAccessToken;
 }
 
+async function uploadZohoAttachment(accessToken, attachment) {
+  const fileName = encodeURIComponent(attachment.filename || "attachment");
+  const url = `https://mail.zoho.eu/api/accounts/${ZOHO_ACCOUNT_ID}/messages/attachments?fileName=${fileName}&isInline=${
+    attachment.contentDisposition === "inline" ? "true" : "false"
+  }`;
+
+  const binary = Buffer.from(attachment.contentBase64, "base64");
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      "Content-Type": attachment.contentType || "application/octet-stream",
+      Accept: "application/json",
+    },
+    body: binary,
+  });
+
+  const raw = await res.text();
+
+  if (!res.ok) {
+    throw new Error(
+      `Zoho attachment upload error ${res.status} (${attachment.filename}): ${raw}`
+    );
+  }
+
+  const data = JSON.parse(raw);
+  const item = Array.isArray(data.data) ? data.data[0] : null;
+
+  if (!item?.attachmentName || !item?.attachmentPath || !item?.storeName) {
+    throw new Error(
+      `Zoho attachment upload missing fields (${attachment.filename}): ${raw}`
+    );
+  }
+
+  return {
+    attachmentName: item.attachmentName,
+    attachmentPath: item.attachmentPath,
+    storeName: item.storeName,
+  };
+}
+
 async function sendViaZeptoMail({
   from,
   to,
   subject,
   textBody,
+  htmlBody,
+  attachments = [],
   jobId,
   provider = "zepto",
 }) {
   const safeText = textBody && textBody.trim() ? textBody : " ";
+  const safeHtml =
+    htmlBody && htmlBody.trim() ? htmlBody : `<pre>${escapeHtml(safeText)}</pre>`;
 
   const payload = {
     from: {
@@ -464,8 +588,16 @@ async function sendViaZeptoMail({
     ],
     subject: subject || "Support Reply",
     textbody: safeText,
-    htmlbody: `<pre>${escapeHtml(safeText)}</pre>`,
+    htmlbody: safeHtml,
   };
+
+  if (attachments.length > 0) {
+    payload.attachments = attachments.map((att) => ({
+      name: att.filename,
+      mime_type: att.contentType,
+      content: att.contentBase64,
+    }));
+  }
 
   for (let attempt = 1; attempt <= PROVIDER_RETRY_COUNT; attempt++) {
     const controller = new AbortController();
@@ -479,6 +611,7 @@ async function sendViaZeptoMail({
         headers: {
           "Content-Type": "application/json",
           Authorization: ZEPTOMAIL_TOKEN,
+          Accept: "application/json",
         },
         body: JSON.stringify(payload),
         signal: controller.signal,
@@ -487,7 +620,7 @@ async function sendViaZeptoMail({
       const raw = await res.text();
 
       console.log(
-        `[ZEPTO][${jobId}] Attempt ${attempt}/${PROVIDER_RETRY_COUNT} -> ${res.status} | ${from} -> ${to} | ${subject}`
+        `[ZEPTO][${jobId}] Attempt ${attempt}/${PROVIDER_RETRY_COUNT} -> ${res.status} | attachments=${attachments.length} | ${from} -> ${to} | ${subject}`
       );
 
       if (!res.ok) {
@@ -542,6 +675,8 @@ async function sendViaZohoMailApi({
   to,
   subject,
   textBody,
+  htmlBody,
+  attachments = [],
   jobId,
   inReplyTo,
   references,
@@ -559,13 +694,24 @@ async function sendViaZohoMailApi({
       beforeProviderSend(provider);
 
       const accessToken = await getZohoAccessToken();
+      let uploadedAttachments = [];
+
+      if (attachments.length > 0) {
+        for (const attachment of attachments) {
+          uploadedAttachments.push(
+            await uploadZohoAttachment(accessToken, attachment)
+          );
+        }
+      }
 
       const payload = {
         fromAddress: actualFrom,
         toAddress: to,
         subject: subject || "Support Reply",
-        content: safeText,
-        mailFormat: "plaintext",
+        content:
+          htmlBody && htmlBody.trim() ? htmlBody : safeText,
+        mailFormat:
+          htmlBody && htmlBody.trim() ? "html" : "plaintext",
       };
 
       if (inReplyTo) payload.inReplyTo = inReplyTo;
@@ -573,6 +719,9 @@ async function sendViaZohoMailApi({
         payload.refHeader = Array.isArray(references)
           ? references.join(" ")
           : references;
+      }
+      if (uploadedAttachments.length > 0) {
+        payload.attachments = uploadedAttachments;
       }
 
       const res = await fetch(
@@ -592,7 +741,7 @@ async function sendViaZohoMailApi({
       const raw = await res.text();
 
       console.log(
-        `[ZOHO-API][${jobId}] Attempt ${attempt}/${PROVIDER_RETRY_COUNT} -> ${res.status} | route=${route.name} | ${actualFrom} -> ${to} | ${subject}`
+        `[ZOHO-API][${jobId}] Attempt ${attempt}/${PROVIDER_RETRY_COUNT} -> ${res.status} | route=${route.name} | attachments=${attachments.length} | ${actualFrom} -> ${to} | ${subject}`
       );
 
       if (!res.ok) {
@@ -651,6 +800,9 @@ async function enqueueSend(data) {
   const route = getRoute(data.to);
   const provider = route.provider === "zoho" ? "zoho" : "zepto";
   const queue = provider === "zoho" ? zohoQueue : zeptoQueue;
+  const attachmentCount = Array.isArray(data.attachments)
+    ? data.attachments.length
+    : 0;
 
   const job = await queue.add("send-email", {
     ...data,
@@ -669,10 +821,11 @@ async function enqueueSend(data) {
     to: maskEmail(data.to),
     subject: trimSubject(data.subject),
     status: "queued",
+    attachmentCount,
   });
 
   console.log(
-    `[QUEUE][${provider.toUpperCase()}][${job.id}] Enqueued | route=${route.name} | ${data.from} -> ${data.to}`
+    `[QUEUE][${provider.toUpperCase()}][${job.id}] Enqueued | route=${route.name} | attachments=${attachmentCount} | ${data.from} -> ${data.to}`
   );
 
   return { job, provider, routeName: route.name };
@@ -690,6 +843,9 @@ function summarize(parsed) {
     messageId: parsed.messageId || "",
     inReplyTo: parsed.inReplyTo || "",
     references: parsed.references || [],
+    attachmentCount: Array.isArray(parsed.attachments)
+      ? parsed.attachments.length
+      : 0,
   };
 }
 
@@ -768,6 +924,15 @@ const zeptoWorker = new Worker(
     metrics.completed.zepto++;
     metrics.lastSentAt.zepto = new Date().toISOString();
 
+    if (Array.isArray(payload.attachments) && payload.attachments.length > 0) {
+      metrics.attachmentJobs++;
+      metrics.attachmentFilesSent += payload.attachments.length;
+      metrics.attachmentBytesSent += payload.attachments.reduce(
+        (sum, att) => sum + Number(att.size || 0),
+        0
+      );
+    }
+
     await addRecentEvent({
       stage: "sent",
       provider: "zepto",
@@ -777,6 +942,9 @@ const zeptoWorker = new Worker(
       to: maskEmail(payload.to),
       subject: trimSubject(payload.subject),
       status: "sent",
+      attachmentCount: Array.isArray(payload.attachments)
+        ? payload.attachments.length
+        : 0,
     });
 
     console.log(`[WORKER][ZEPTO][${job.id}] Sent`);
@@ -805,6 +973,15 @@ const zohoWorker = new Worker(
     metrics.completed.zoho++;
     metrics.lastSentAt.zoho = new Date().toISOString();
 
+    if (Array.isArray(payload.attachments) && payload.attachments.length > 0) {
+      metrics.attachmentJobs++;
+      metrics.attachmentFilesSent += payload.attachments.length;
+      metrics.attachmentBytesSent += payload.attachments.reduce(
+        (sum, att) => sum + Number(att.size || 0),
+        0
+      );
+    }
+
     await addRecentEvent({
       stage: "sent",
       provider: "zoho",
@@ -814,6 +991,9 @@ const zohoWorker = new Worker(
       to: maskEmail(payload.to),
       subject: trimSubject(payload.subject),
       status: "sent",
+      attachmentCount: Array.isArray(payload.attachments)
+        ? payload.attachments.length
+        : 0,
     });
 
     console.log(`[WORKER][ZOHO][${job.id}] Sent`);
@@ -839,6 +1019,9 @@ zeptoWorker.on("failed", async (job, err) => {
     status: "failed",
     error: safeString(err?.message || String(err)),
     attemptsMade: job?.attemptsMade ?? null,
+    attachmentCount: Array.isArray(job?.data?.attachments)
+      ? job.data.attachments.length
+      : 0,
   });
 
   console.error(
@@ -861,6 +1044,9 @@ zohoWorker.on("failed", async (job, err) => {
     status: "failed",
     error: safeString(err?.message || String(err)),
     attemptsMade: job?.attemptsMade ?? null,
+    attachmentCount: Array.isArray(job?.data?.attachments)
+      ? job.data.attachments.length
+      : 0,
   });
 
   console.error(
@@ -915,9 +1101,24 @@ const server = new SMTPServer({
 
       const rawText = parsed.text || "";
       const cleanedText = cleanText(rawText);
+
+      const rawHtml =
+        typeof parsed.html === "string"
+          ? parsed.html
+          : cleanedText
+          ? `<pre>${escapeHtml(cleanedText)}</pre>`
+          : "";
+
+      const attachments = serializeAttachments(parsed.attachments || []);
+      const totalAttachmentBytes = validateAttachments(attachments);
       const route = getRoute(to);
 
-      console.log("[CLEAN] text before/after:", rawText.length, "->", cleanedText.length);
+      console.log(
+        "[CLEAN] text before/after:",
+        rawText.length,
+        "->",
+        cleanedText.length
+      );
       console.log(
         "[ROUTE]",
         route.name.toUpperCase(),
@@ -931,15 +1132,22 @@ const server = new SMTPServer({
         inReplyTo,
         references: Array.isArray(references) ? references.join(" ") : references,
       });
+      console.log("[ATTACHMENTS]", {
+        count: attachments.length,
+        totalBytes: totalAttachmentBytes,
+        items: summarizeAttachments(attachments),
+      });
 
       const { job, provider } = await enqueueSend({
         from,
         to,
         subject,
         textBody: cleanedText,
+        htmlBody: rawHtml,
         inReplyTo,
         references,
         messageId,
+        attachments,
       });
 
       metrics.accepted++;
@@ -1097,6 +1305,11 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("[BOOT] BREAKER_WINDOW_MS =", BREAKER_WINDOW_MS);
   console.log("[BOOT] BREAKER_OPEN_MS =", BREAKER_OPEN_MS);
   console.log("[BOOT] RECENT_EMAILS_LIMIT =", RECENT_EMAILS_LIMIT);
+  console.log("[BOOT] MAX_ATTACHMENT_BYTES =", MAX_ATTACHMENT_BYTES);
+  console.log(
+    "[BOOT] MAX_TOTAL_ATTACHMENTS_BYTES =",
+    MAX_TOTAL_ATTACHMENTS_BYTES
+  );
   console.log("[BOOT] ROUTE_RULES =", JSON.stringify(ROUTE_RULES));
 });
 
