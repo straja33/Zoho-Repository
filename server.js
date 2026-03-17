@@ -244,7 +244,9 @@ function cleanText(text = "") {
     const line = lines[i].toLowerCase();
 
     if (SIGNATURE_DOMAINS.some((domain) => line.includes(domain))) {
-      return lines.slice(0, i + 1).join("\n").trim();
+      let result = lines.slice(0, i + 1).join("\n").trim();
+      result = result.replace(/\s*\(https?:\/\/[^\)]*\)\s*$/i, "");
+      return result.trim();
     }
   }
 
