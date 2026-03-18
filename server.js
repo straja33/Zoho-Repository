@@ -240,6 +240,16 @@ function sleep(ms) {
 function cleanText(text = "") {
   const lines = String(text || "").split(/\r?\n/);
 
+  // Primary: cut at 🌐 line (always last line of signature)
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes("🌐")) {
+      let result = lines.slice(0, i + 1).join("\n").trim();
+      result = result.replace(/\s*\(https?:\/\/[^\)]*\)\s*$/i, "");
+      return result.trim();
+    }
+  }
+
+  // Fallback: cut at signature domain
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].toLowerCase();
 
